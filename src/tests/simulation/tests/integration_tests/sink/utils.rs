@@ -35,8 +35,11 @@ use risingwave_common::catalog::Field;
 use risingwave_common::row::Row;
 use risingwave_common::types::{DataType, ScalarImpl};
 use risingwave_common::util::chunk_coalesce::DataChunkBuilder;
+use risingwave_connector::sink::boxed::{BoxLogSinker, DynLogReader};
 use risingwave_connector::sink::coordinate::CoordinatedLogSinker;
-use risingwave_connector::sink::log_store::DeliveryFutureManagerAddFuture;
+use risingwave_connector::sink::log_store::{
+    DeliveryFutureManagerAddFuture, LogStoreReadItem, ReportedSinkErrorRow, TruncateOffset,
+};
 use risingwave_connector::sink::test_sink::{
     TestSinkRegistryGuard, register_build_coordinated_sink, register_build_sink,
 };
@@ -44,8 +47,8 @@ use risingwave_connector::sink::writer::{
     AsyncTruncateSinkWriter, AsyncTruncateSinkWriterExt, SinkWriter,
 };
 use risingwave_connector::sink::{
-    SinglePhaseCommitCoordinator, SinkCommitCoordinator, SinkCommittedEpochSubscriber, SinkError,
-    TwoPhaseCommitCoordinator,
+    LogSinker, SinglePhaseCommitCoordinator, SinkCommitCoordinator, SinkCommittedEpochSubscriber,
+    SinkError, SinkLogReader, TwoPhaseCommitCoordinator,
 };
 use risingwave_connector::source::test_source::{
     BoxSource, TestSourceRegistryGuard, TestSourceSplit, register_test_source,
@@ -495,6 +498,7 @@ pub enum TestSinkType {
     SinglePhaseCoordinatedSink,
     TwoPhaseCoordinatedSink,
     AsyncTruncate,
+    ReportError,
 }
 
 #[macro_export]
@@ -505,6 +509,7 @@ macro_rules! for_all_sink_types {
             SinglePhaseCoordinatedSink,
             TwoPhaseCoordinatedSink,
             AsyncTruncate,
+            ReportError,
         }
     };
 }
@@ -655,6 +660,68 @@ impl SimulationTestSink {
                         }
                         .into_log_sinker(10),
                     );
+                    async move { Ok(log_sinker) }.boxed()
+                }
+            }),
+            TestSinkType::ReportError => register_build_sink({
+                let parallelism_counter = parallelism_counter.clone();
+                let store = store.clone();
+                move |_, _| {
+                    parallelism_counter.fetch_add(1, Relaxed);
+                    let store = store.clone();
+                    let parallelism_counter = parallelism_counter.clone();
+                    let log_sinker: BoxLogSinker =
+                        Box::new(move |mut log_reader: &mut dyn DynLogReader| {
+                            async move {
+                                struct ParallelismGuard(Arc<AtomicUsize>);
+
+                                impl Drop for ParallelismGuard {
+                                    fn drop(&mut self) {
+                                        self.0.fetch_sub(1, Relaxed);
+                                    }
+                                }
+
+                                let _parallelism_guard = ParallelismGuard(parallelism_counter);
+
+                                log_reader.start_from(None).await?;
+                                loop {
+                                    let (epoch, item) = log_reader.next_item().await?;
+                                    match item {
+                                        LogStoreReadItem::StreamChunk { chunk, chunk_id } => {
+                                            let mut reported_error_rows = vec![];
+                                            for (op, row) in chunk.rows() {
+                                                assert_eq!(op, Op::Insert);
+                                                let id = row.datum_at(0).unwrap().into_int32();
+                                                let name = row
+                                                    .datum_at(1)
+                                                    .unwrap()
+                                                    .into_utf8()
+                                                    .to_string();
+                                                store.insert(id, name);
+                                                reported_error_rows.push(ReportedSinkErrorRow {
+                                                    op,
+                                                    row: row.to_owned_row(),
+                                                });
+                                            }
+                                            log_reader.truncate(
+                                                TruncateOffset::Chunk { epoch, chunk_id },
+                                                reported_error_rows,
+                                            )?;
+                                        }
+                                        LogStoreReadItem::Barrier { is_checkpoint, .. } => {
+                                            if is_checkpoint {
+                                                store.inc_checkpoint();
+                                            }
+                                            log_reader.truncate(
+                                                TruncateOffset::Barrier { epoch },
+                                                vec![],
+                                            )?;
+                                        }
+                                    }
+                                }
+                            }
+                            .boxed()
+                        });
                     async move { Ok(log_sinker) }.boxed()
                 }
             }),

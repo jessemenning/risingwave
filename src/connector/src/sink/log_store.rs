@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::future::{Future, pending, poll_fn};
 use std::pin::pin;
@@ -24,10 +24,11 @@ use std::time::Instant;
 use await_tree::InstrumentAwait;
 use futures::future::BoxFuture;
 use futures::{TryFuture, TryFutureExt};
-use risingwave_common::array::StreamChunk;
+use risingwave_common::array::{Op, StreamChunk};
 use risingwave_common::bail;
 use risingwave_common::bitmap::Bitmap;
 use risingwave_common::metrics::{LabelGuardedIntCounter, LabelGuardedIntGauge};
+use risingwave_common::row::OwnedRow;
 use risingwave_common::util::epoch::{EpochPair, INVALID_EPOCH};
 use risingwave_common_estimate_size::EstimateSize;
 use risingwave_common_rate_limit::{RateLimit, RateLimiter};
@@ -38,7 +39,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 pub type LogStoreResult<T> = Result<T, anyhow::Error>;
 pub type ChunkId = usize;
 
-#[derive(Debug, PartialEq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 pub enum TruncateOffset {
     Chunk { epoch: u64, chunk_id: ChunkId },
     Barrier { epoch: u64 },
@@ -150,6 +151,23 @@ pub struct FlushCurrentEpochOptions {
     pub schema_change: Option<PbSinkSchemaChange>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ReportedSinkErrorRow {
+    pub op: Op,
+    pub row: OwnedRow,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReportedSinkErrorRows {
+    pub epoch: u64,
+    pub rows: Vec<ReportedSinkErrorRow>,
+}
+
+pub struct FlushCurrentEpochResult<'a> {
+    pub post_flush: LogWriterPostFlushCurrentEpoch<'a>,
+    pub reported_error_rows: Vec<ReportedSinkErrorRows>,
+}
+
 pub trait LogWriter: Send {
     /// Initialize the log writer with an epoch
     fn init(
@@ -169,7 +187,7 @@ pub trait LogWriter: Send {
         &mut self,
         next_epoch: u64,
         options: FlushCurrentEpochOptions,
-    ) -> impl Future<Output = LogStoreResult<LogWriterPostFlushCurrentEpoch<'_>>> + Send + '_;
+    ) -> impl Future<Output = LogStoreResult<FlushCurrentEpochResult<'_>>> + Send + '_;
 
     fn pause(&mut self) -> LogStoreResult<()>;
 
@@ -195,7 +213,11 @@ pub trait LogReader: Send + Sized + 'static {
 
     /// Mark that all items emitted so far have been consumed and it is safe to truncate the log
     /// from the current offset.
-    fn truncate(&mut self, offset: TruncateOffset) -> LogStoreResult<()>;
+    fn truncate(
+        &mut self,
+        offset: TruncateOffset,
+        error_rows: Vec<ReportedSinkErrorRow>,
+    ) -> LogStoreResult<()>;
 
     /// Reset the log reader to after the latest truncate offset
     ///
@@ -236,8 +258,12 @@ impl<F: Fn(StreamChunk) -> StreamChunk + Send + 'static, R: LogReader> LogReader
         Ok((epoch, item))
     }
 
-    fn truncate(&mut self, offset: TruncateOffset) -> LogStoreResult<()> {
-        self.inner.truncate(offset)
+    fn truncate(
+        &mut self,
+        offset: TruncateOffset,
+        error_rows: Vec<ReportedSinkErrorRow>,
+    ) -> LogStoreResult<()> {
+        self.inner.truncate(offset, error_rows)
     }
 
     fn rewind(&mut self) -> impl Future<Output = LogStoreResult<()>> + Send + '_ {
@@ -288,8 +314,12 @@ impl<R: LogReader> LogReader for BackpressureMonitoredLogReader<R> {
         })
     }
 
-    fn truncate(&mut self, offset: TruncateOffset) -> LogStoreResult<()> {
-        self.inner.truncate(offset)
+    fn truncate(
+        &mut self,
+        offset: TruncateOffset,
+        error_rows: Vec<ReportedSinkErrorRow>,
+    ) -> LogStoreResult<()> {
+        self.inner.truncate(offset, error_rows)
     }
 
     fn rewind(&mut self) -> impl Future<Output = LogStoreResult<()>> + Send + '_ {
@@ -355,8 +385,12 @@ impl<R: LogReader> LogReader for MonitoredLogReader<R> {
             })
     }
 
-    fn truncate(&mut self, offset: TruncateOffset) -> LogStoreResult<()> {
-        self.inner.truncate(offset)
+    fn truncate(
+        &mut self,
+        offset: TruncateOffset,
+        error_rows: Vec<ReportedSinkErrorRow>,
+    ) -> LogStoreResult<()> {
+        self.inner.truncate(offset, error_rows)
     }
 
     fn rewind(&mut self) -> impl Future<Output = LogStoreResult<()>> + Send + '_ {
@@ -371,7 +405,7 @@ impl<R: LogReader> LogReader for MonitoredLogReader<R> {
     }
 }
 
-#[derive(Copy, Clone, PartialOrd, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialOrd, PartialEq, Eq, Hash, Debug)]
 struct UpstreamChunkOffset(TruncateOffset);
 #[derive(Copy, Clone, PartialOrd, PartialEq)]
 struct DownstreamChunkOffset(TruncateOffset);
@@ -386,6 +420,7 @@ struct RateLimitedLogReaderCore<R: LogReader> {
     )>,
     // Newer items at the front, push_front, pop_back
     consumed_offset_queue: VecDeque<(UpstreamChunkOffset, VecDeque<DownstreamChunkOffset>)>,
+    pending_error_rows: HashMap<UpstreamChunkOffset, Vec<ReportedSinkErrorRow>>,
     next_chunk_id: usize,
     rate_limiter: RateLimiter,
 }
@@ -402,6 +437,7 @@ impl<R: LogReader> RateLimitedLogReader<R> {
                 inner,
                 consuming_chunk: None,
                 consumed_offset_queue: VecDeque::new(),
+                pending_error_rows: HashMap::new(),
                 next_chunk_id: 0,
                 rate_limiter: RateLimiter::new(RateLimit::Disabled),
             },
@@ -554,9 +590,14 @@ impl<R: LogReader> LogReader for RateLimitedLogReader<R> {
         }
     }
 
-    fn truncate(&mut self, offset: TruncateOffset) -> LogStoreResult<()> {
+    fn truncate(
+        &mut self,
+        offset: TruncateOffset,
+        error_rows: Vec<ReportedSinkErrorRow>,
+    ) -> LogStoreResult<()> {
         let downstream_offset = DownstreamChunkOffset(offset);
         let mut truncate_offset = None;
+        let mut affected_upstream_offset = None;
         let mut stop = false;
         'outer: while let Some((upstream_offset, downstream_offsets)) =
             self.core.consumed_offset_queue.back_mut()
@@ -564,6 +605,7 @@ impl<R: LogReader> LogReader for RateLimitedLogReader<R> {
             while let Some(prev_downstream_offset) = downstream_offsets.back() {
                 if *prev_downstream_offset <= downstream_offset {
                     downstream_offsets.pop_back();
+                    affected_upstream_offset = Some(*upstream_offset);
                 } else {
                     stop = true;
                     break 'outer;
@@ -572,15 +614,27 @@ impl<R: LogReader> LogReader for RateLimitedLogReader<R> {
             truncate_offset = Some(*upstream_offset);
             self.core.consumed_offset_queue.pop_back();
         }
-        if !stop && let Some((_, downstream_offsets, _)) = &mut self.core.consuming_chunk {
+        if !stop
+            && let Some((upstream_offset, downstream_offsets, _)) = &mut self.core.consuming_chunk
+        {
             while let Some(prev_downstream_offset) = downstream_offsets.back() {
                 if *prev_downstream_offset <= downstream_offset {
                     downstream_offsets.pop_back();
+                    affected_upstream_offset = Some(*upstream_offset);
                 } else {
                     // stop = true;
                     break;
                 }
             }
+        }
+        if !error_rows.is_empty()
+            && let Some(upstream_offset) = affected_upstream_offset
+        {
+            self.core
+                .pending_error_rows
+                .entry(upstream_offset)
+                .or_default()
+                .extend(error_rows);
         }
         tracing::trace!(
             "rate limited log store reader truncate offset {:?}, downstream offset {:?}",
@@ -588,7 +642,12 @@ impl<R: LogReader> LogReader for RateLimitedLogReader<R> {
             offset
         );
         if let Some(offset) = truncate_offset {
-            self.core.inner.truncate(offset.0)
+            let error_rows = self
+                .core
+                .pending_error_rows
+                .remove(&offset)
+                .unwrap_or_default();
+            self.core.inner.truncate(offset.0, error_rows)
         } else {
             Ok(())
         }
@@ -673,12 +732,15 @@ impl<W: LogWriter> LogWriter for MonitoredLogWriter<W> {
         &mut self,
         next_epoch: u64,
         options: FlushCurrentEpochOptions,
-    ) -> LogStoreResult<LogWriterPostFlushCurrentEpoch<'_>> {
-        let post_flush = self.inner.flush_current_epoch(next_epoch, options).await?;
+    ) -> LogStoreResult<FlushCurrentEpochResult<'_>> {
+        let mut result = self.inner.flush_current_epoch(next_epoch, options).await?;
         self.metrics
             .log_store_latest_write_epoch
             .set(next_epoch as _);
-        Ok(post_flush)
+        Ok(FlushCurrentEpochResult {
+            post_flush: result.post_flush,
+            reported_error_rows: std::mem::take(&mut result.reported_error_rows),
+        })
     }
 
     fn pause(&mut self) -> LogStoreResult<()> {

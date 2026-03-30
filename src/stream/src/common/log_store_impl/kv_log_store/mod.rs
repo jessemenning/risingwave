@@ -23,7 +23,7 @@ use risingwave_common::metrics::{
     LabelGuardedHistogram, LabelGuardedIntCounter, LabelGuardedIntGauge,
 };
 use risingwave_connector::sink::SinkParam;
-use risingwave_connector::sink::log_store::LogStoreFactory;
+use risingwave_connector::sink::log_store::{LogStoreFactory, ReportedSinkErrorRow};
 use risingwave_pb::catalog::Table;
 use risingwave_storage::StateStore;
 use risingwave_storage::store::{LocalStateStore, NewLocalOptions, OpConsistencyLevel};
@@ -190,6 +190,12 @@ pub(crate) const FIRST_SEQ_ID: SeqId = 0;
 /// Readers truncate the offset at the granularity of seq id.
 /// None `SeqIdType` means that the whole epoch is truncated.
 pub(crate) type ReaderTruncationOffsetType = (u64, Option<SeqId>);
+
+#[derive(Clone)]
+pub(crate) struct ReaderTruncationProgress {
+    pub offset: ReaderTruncationOffsetType,
+    pub reported_error_rows: Vec<ReportedSinkErrorRow>,
+}
 
 #[derive(Clone)]
 pub struct KvLogStoreReadMetrics {
@@ -888,7 +894,7 @@ mod tests {
         test_env.commit_epoch(epoch2).await;
         // The truncate does not work because it is after the sync
         reader
-            .truncate(TruncateOffset::Barrier { epoch: epoch2 })
+            .truncate(TruncateOffset::Barrier { epoch: epoch2 }, vec![])
             .unwrap();
 
         drop(writer);
@@ -1089,10 +1095,13 @@ mod tests {
 
         // The truncate should work because it is before the flush
         reader
-            .truncate(TruncateOffset::Chunk {
-                epoch: epoch1,
-                chunk_id: chunk_id1,
-            })
+            .truncate(
+                TruncateOffset::Chunk {
+                    epoch: epoch1,
+                    chunk_id: chunk_id1,
+                },
+                vec![],
+            )
             .unwrap();
         let epoch3 = epoch2.next_epoch();
         writer
@@ -1314,7 +1323,7 @@ mod tests {
 
         // Only reader1 will truncate
         reader1
-            .truncate(TruncateOffset::Barrier { epoch: epoch1 })
+            .truncate(TruncateOffset::Barrier { epoch: epoch1 }, vec![])
             .unwrap();
 
         match reader1.next_item().await.unwrap() {
@@ -1660,10 +1669,13 @@ mod tests {
         assert_eq!(3, chunk_ids.len());
 
         reader
-            .truncate(TruncateOffset::Chunk {
-                epoch: epoch1,
-                chunk_id: chunk_ids[0],
-            })
+            .truncate(
+                TruncateOffset::Chunk {
+                    epoch: epoch1,
+                    chunk_id: chunk_ids[0],
+                },
+                vec![],
+            )
             .unwrap();
         reader.rewind().await.unwrap();
         reader.start_from(None).await.unwrap();
@@ -1680,7 +1692,7 @@ mod tests {
         assert_eq!(2, chunk_ids.len());
 
         reader
-            .truncate(TruncateOffset::Barrier { epoch: epoch1 })
+            .truncate(TruncateOffset::Barrier { epoch: epoch1 }, vec![])
             .unwrap();
         reader.rewind().await.unwrap();
         reader.start_from(None).await.unwrap();
@@ -1696,10 +1708,13 @@ mod tests {
         assert_eq!(2, chunk_ids.len());
 
         reader
-            .truncate(TruncateOffset::Chunk {
-                epoch: epoch3,
-                chunk_id: chunk_ids[1],
-            })
+            .truncate(
+                TruncateOffset::Chunk {
+                    epoch: epoch3,
+                    chunk_id: chunk_ids[1],
+                },
+                vec![],
+            )
             .unwrap();
         reader.rewind().await.unwrap();
         reader.start_from(None).await.unwrap();
@@ -1744,7 +1759,7 @@ mod tests {
         assert_eq!(3, check_reader(&mut reader, data.iter()).await.len());
 
         reader
-            .truncate(TruncateOffset::Barrier { epoch: epoch1 })
+            .truncate(TruncateOffset::Barrier { epoch: epoch1 }, vec![])
             .unwrap();
         reader.rewind().await.unwrap();
         reader.start_from(None).await.unwrap();
@@ -1752,10 +1767,13 @@ mod tests {
         assert_eq!(2, chunk_ids.len());
 
         reader
-            .truncate(TruncateOffset::Chunk {
-                epoch: epoch2,
-                chunk_id: chunk_ids[0],
-            })
+            .truncate(
+                TruncateOffset::Chunk {
+                    epoch: epoch2,
+                    chunk_id: chunk_ids[0],
+                },
+                vec![],
+            )
             .unwrap();
         reader.rewind().await.unwrap();
         reader.start_from(None).await.unwrap();
@@ -1763,14 +1781,17 @@ mod tests {
         assert_eq!(2, chunk_ids.len());
 
         reader
-            .truncate(TruncateOffset::Chunk {
-                epoch: epoch2,
-                chunk_id: chunk_ids[0],
-            })
+            .truncate(
+                TruncateOffset::Chunk {
+                    epoch: epoch2,
+                    chunk_id: chunk_ids[0],
+                },
+                vec![],
+            )
             .unwrap();
 
         reader
-            .truncate(TruncateOffset::Barrier { epoch: epoch2 })
+            .truncate(TruncateOffset::Barrier { epoch: epoch2 }, vec![])
             .unwrap();
         reader.rewind().await.unwrap();
         reader.start_from(None).await.unwrap();
@@ -1827,7 +1848,7 @@ mod tests {
         );
 
         reader
-            .truncate(TruncateOffset::Barrier { epoch: epoch1 })
+            .truncate(TruncateOffset::Barrier { epoch: epoch1 }, vec![])
             .unwrap();
         reader.rewind().await.unwrap();
         reader.start_from(None).await.unwrap();
@@ -1835,10 +1856,13 @@ mod tests {
         assert_eq!(4, chunk_ids.len());
 
         reader
-            .truncate(TruncateOffset::Chunk {
-                epoch: epoch2,
-                chunk_id: chunk_ids[0],
-            })
+            .truncate(
+                TruncateOffset::Chunk {
+                    epoch: epoch2,
+                    chunk_id: chunk_ids[0],
+                },
+                vec![],
+            )
             .unwrap();
         reader.rewind().await.unwrap();
         reader.start_from(None).await.unwrap();
@@ -1846,7 +1870,7 @@ mod tests {
         assert_eq!(4, chunk_ids.len());
 
         reader
-            .truncate(TruncateOffset::Barrier { epoch: epoch2 })
+            .truncate(TruncateOffset::Barrier { epoch: epoch2 }, vec![])
             .unwrap();
         reader.rewind().await.unwrap();
         reader.start_from(None).await.unwrap();
@@ -1854,7 +1878,7 @@ mod tests {
         assert_eq!(3, chunk_ids.len());
 
         reader
-            .truncate(TruncateOffset::Barrier { epoch: epoch3 })
+            .truncate(TruncateOffset::Barrier { epoch: epoch3 }, vec![])
             .unwrap();
         reader.rewind().await.unwrap();
         reader.start_from(None).await.unwrap();
@@ -1862,10 +1886,13 @@ mod tests {
         assert_eq!(2, chunk_ids.len());
 
         reader
-            .truncate(TruncateOffset::Chunk {
-                epoch: epoch4,
-                chunk_id: chunk_ids[0],
-            })
+            .truncate(
+                TruncateOffset::Chunk {
+                    epoch: epoch4,
+                    chunk_id: chunk_ids[0],
+                },
+                vec![],
+            )
             .unwrap();
         reader.rewind().await.unwrap();
         reader.start_from(None).await.unwrap();
@@ -1877,7 +1904,7 @@ mod tests {
         assert_eq!(1, chunk_ids.len());
 
         reader
-            .truncate(TruncateOffset::Barrier { epoch: epoch4 })
+            .truncate(TruncateOffset::Barrier { epoch: epoch4 }, vec![])
             .unwrap();
         reader.rewind().await.unwrap();
         reader.start_from(None).await.unwrap();
@@ -1886,10 +1913,13 @@ mod tests {
         assert_eq!(1, chunk_ids.len());
 
         reader
-            .truncate(TruncateOffset::Chunk {
-                epoch: epoch5,
-                chunk_id: chunk_ids[0],
-            })
+            .truncate(
+                TruncateOffset::Chunk {
+                    epoch: epoch5,
+                    chunk_id: chunk_ids[0],
+                },
+                vec![],
+            )
             .unwrap();
         reader.rewind().await.unwrap();
         reader.start_from(None).await.unwrap();
@@ -2107,7 +2137,7 @@ mod tests {
         .await;
         // The truncate should take effect
         reader
-            .truncate(TruncateOffset::Barrier { epoch: epoch1 })
+            .truncate(TruncateOffset::Barrier { epoch: epoch1 }, vec![])
             .unwrap();
         let epoch4 = epoch3.next_epoch();
         writer
@@ -2287,14 +2317,16 @@ mod tests {
                 assert!(is_checkpoint);
                 assert_eq!(read_schema_change, Some(schema_change.clone()));
                 reader
-                    .truncate(TruncateOffset::Barrier { epoch: epoch1 })
+                    .truncate(TruncateOffset::Barrier { epoch: epoch1 }, vec![])
                     .unwrap();
             }
             item => unreachable!("{:?}", item),
         }
 
-        let post_flush = flush_future.await.unwrap();
-        post_flush.post_yield_barrier().await.unwrap();
+        {
+            let post_flush = flush_future.await.unwrap();
+            post_flush.post_flush.post_yield_barrier().await.unwrap();
+        }
 
         // Writer should be able to continue with the next epoch after reader truncation.
         writer.write_chunk(gen_stream_chunk(10)).await.unwrap();

@@ -22,12 +22,14 @@ use parking_lot::{Mutex, MutexGuard};
 use risingwave_common::array::StreamChunk;
 use risingwave_common::bitmap::Bitmap;
 use risingwave_common_estimate_size::EstimateSize;
-use risingwave_connector::sink::log_store::{ChunkId, LogStoreResult, TruncateOffset};
+use risingwave_connector::sink::log_store::{
+    ChunkId, LogStoreResult, ReportedSinkErrorRow, ReportedSinkErrorRows, TruncateOffset,
+};
 use risingwave_pb::stream_plan::PbSinkSchemaChange;
 use tokio::sync::Notify;
 
 use crate::common::log_store_impl::kv_log_store::{
-    KvLogStoreMetrics, ReaderTruncationOffsetType, SeqId,
+    KvLogStoreMetrics, ReaderTruncationOffsetType, ReaderTruncationProgress, SeqId,
 };
 
 #[derive(Clone)]
@@ -78,7 +80,7 @@ struct LogStoreBufferInner {
     max_row_count: usize,
     chunk_size: usize,
 
-    truncation_list: VecDeque<ReaderTruncationOffsetType>,
+    truncation_list: VecDeque<ReaderTruncationProgress>,
 
     next_chunk_id: ChunkId,
 
@@ -226,13 +228,17 @@ impl LogStoreBufferInner {
         self.update_buffer_metrics();
     }
 
-    fn add_truncate_offset(&mut self, (epoch, seq_id): ReaderTruncationOffsetType) {
-        if let Some((prev_epoch, prev_seq_id)) = self.truncation_list.back_mut()
-            && *prev_epoch == epoch
+    fn add_truncate_offset(&mut self, progress: ReaderTruncationProgress) {
+        let (epoch, seq_id) = progress.offset;
+        if let Some(prev_progress) = self.truncation_list.back_mut()
+            && prev_progress.offset.0 == epoch
         {
-            *prev_seq_id = seq_id;
+            prev_progress.offset.1 = seq_id;
+            prev_progress
+                .reported_error_rows
+                .extend(progress.reported_error_rows);
         } else {
-            self.truncation_list.push_back((epoch, seq_id));
+            self.truncation_list.push_back(progress);
         }
     }
 
@@ -336,15 +342,26 @@ impl LogStoreBufferSender {
         self.update_notify.notify_waiters();
     }
 
-    pub(crate) fn pop_truncation(&self, curr_epoch: u64) -> Option<ReaderTruncationOffsetType> {
+    pub(crate) fn pop_truncation(
+        &self,
+        curr_epoch: u64,
+    ) -> Option<(ReaderTruncationOffsetType, Vec<ReportedSinkErrorRows>)> {
         let mut inner = self.buffer.inner();
-        let mut ret = None;
-        while let Some((epoch, _)) = inner.truncation_list.front()
-            && *epoch < curr_epoch
+        let mut latest_offset = None;
+        let mut reported_error_rows = vec![];
+        while let Some(progress) = inner.truncation_list.front()
+            && progress.offset.0 < curr_epoch
         {
-            ret = inner.truncation_list.pop_front();
+            let progress = inner.truncation_list.pop_front().expect("checked some");
+            latest_offset = Some(progress.offset);
+            if !progress.reported_error_rows.is_empty() {
+                reported_error_rows.push(ReportedSinkErrorRows {
+                    epoch: progress.offset.0,
+                    rows: progress.reported_error_rows,
+                });
+            }
         }
-        ret
+        latest_offset.map(|offset| (offset, reported_error_rows))
     }
 
     pub(crate) async fn wait_for_barrier_truncation(
@@ -356,7 +373,8 @@ impl LogStoreBufferSender {
 
             {
                 let mut inner = self.buffer.inner();
-                while let Some((epoch, seq_id)) = inner.truncation_list.pop_front() {
+                while let Some(progress) = inner.truncation_list.pop_front() {
+                    let (epoch, seq_id) = progress.offset;
                     if epoch > curr_epoch {
                         // TODO: should panic, after we confirm the correctness
                         return Err(anyhow::anyhow!(
@@ -433,7 +451,11 @@ impl LogStoreBufferReceiver {
         }
     }
 
-    pub(crate) fn truncate_buffer(&mut self, offset: TruncateOffset) {
+    pub(crate) fn truncate_buffer(
+        &mut self,
+        offset: TruncateOffset,
+        reported_error_rows: Vec<ReportedSinkErrorRow>,
+    ) {
         let mut inner = self.buffer.inner();
         let mut latest_offset: Option<ReaderTruncationOffsetType> = None;
         while let Some((epoch, item)) = inner.consumed_queue.back() {
@@ -492,14 +514,24 @@ impl LogStoreBufferReceiver {
         }
         inner.update_buffer_metrics();
         if let Some(offset) = latest_offset {
-            inner.add_truncate_offset(offset);
+            inner.add_truncate_offset(ReaderTruncationProgress {
+                offset,
+                reported_error_rows,
+            });
             self.truncate_notify.notify_waiters();
         }
     }
 
-    pub(crate) fn truncate_historical(&mut self, epoch: u64) {
+    pub(crate) fn truncate_historical(
+        &mut self,
+        epoch: u64,
+        reported_error_rows: Vec<ReportedSinkErrorRow>,
+    ) {
         let mut inner = self.buffer.inner();
-        inner.add_truncate_offset((epoch, None));
+        inner.add_truncate_offset(ReaderTruncationProgress {
+            offset: (epoch, None),
+            reported_error_rows,
+        });
         self.truncate_notify.notify_waiters();
     }
 
