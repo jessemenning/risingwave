@@ -17,12 +17,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use itertools::Itertools;
-use risingwave_simulation::cluster::{Cluster, ConfigPath, Configuration};
+use risingwave_simulation::cluster::{Cluster, ConfigPath, Configuration, Session};
 use tempfile::NamedTempFile;
 use tokio::time::sleep;
 
+use crate::assert_eq_with_err_returned as assert_eq;
 use crate::sink::utils::*;
-use crate::{assert_eq_with_err_returned as assert_eq, assert_with_err_returned as assert};
 
 async fn start_error_table_test_cluster() -> Result<Cluster> {
     let config_path = {
@@ -46,66 +46,188 @@ async fn start_error_table_test_cluster() -> Result<Cluster> {
     .await
 }
 
-#[tokio::test]
-async fn test_sink_error_table() -> Result<()> {
+async fn find_latest_error_table_name(session: &mut Session, sink_name: &str) -> Result<String> {
+    let table_name_prefix = format!("public.__internal_{}_", sink_name);
+    let internal_tables = session.run("show internal tables").await?;
+    internal_tables
+        .lines()
+        .filter(|line| {
+            line.contains(&table_name_prefix) && line.to_ascii_lowercase().contains("sinkerror")
+        })
+        .map(str::to_owned)
+        .max()
+        .ok_or_else(|| anyhow::anyhow!("failed to find sink error internal table for {sink_name}"))
+}
+
+async fn wait_for_error_table_count(
+    session: &mut Session,
+    error_table_name: &str,
+    expected_count: usize,
+) -> Result<()> {
+    let count_sql = format!("select count(*) from {}", error_table_name);
+    let ids_sql = format!("select id from {} order by id", error_table_name);
+    let mut last_count = String::new();
+    for attempt in 0..100 {
+        let count_result = session.run(&count_sql).await?;
+        last_count = count_result.trim().to_owned();
+        if count_result.trim() == expected_count.to_string() {
+            return Ok(());
+        }
+        if attempt % 5 == 4 {
+            session.run("flush").await?;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let persisted_ids = session.run(&ids_sql).await?;
+    Err(anyhow::anyhow!(
+        "timed out waiting for error table count {} in {} (last count = {}, ids = [{}])",
+        expected_count,
+        error_table_name,
+        last_count,
+        persisted_ids.trim()
+    ))
+}
+
+async fn query_error_table_rows_with_age(
+    session: &mut Session,
+    error_table_name: &str,
+) -> Result<String> {
+    let sql = format!(
+        "select sink_error_row_op, id, name, \
+                coalesce(age::varchar, 'NULL'), \
+                sink_error_extra_info->>'column_count' \
+         from {} order by id",
+        error_table_name
+    );
+    let mut last_error = None;
+    for attempt in 0..100 {
+        match session.run(&sql).await {
+            Ok(rows) => return Ok(rows),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt % 5 == 4 {
+                    session.run("flush").await?;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    Err(last_error.expect("should record query error"))
+}
+
+fn format_insert_rows(rows: impl IntoIterator<Item = (i32, String, Option<i32>)>) -> String {
+    rows.into_iter()
+        .map(|(id, name, age)| match age {
+            Some(age) => format!("({}, '{}', {})", id, name, age),
+            None => format!("({}, '{}')", id, name),
+        })
+        .join(", ")
+}
+
+async fn run_sink_error_table_test(decouple: bool) -> Result<()> {
     let mut cluster = start_error_table_test_cluster().await?;
     let test_sink = SimulationTestSink::register_new(TestSinkType::ReportError);
-    let test_source = SimulationTestSource::register_new(2, 0..10, 1.0, 2);
 
     let mut session = cluster.start_session();
     session.run("set streaming_parallelism = 2").await?;
-    session.run("set sink_decouple = false").await?;
-    session.run(CREATE_SOURCE).await?;
     session
-        .run(
-            "create sink test_sink from test_source with (connector = 'test', type = 'upsert', skip_error = 'true')",
-        )
+        .run(format!("set sink_decouple = {}", decouple))
+        .await?;
+    session
+        .run("create table test_table_error (id int primary key, name varchar)")
+        .await?;
+    session
+        .run("create sink test_sink_error from test_table_error with (connector = 'test', type = 'upsert', skip_error = 'true', auto_schema_change = 'true')")
         .await?;
 
-    test_sink.wait_initial_parallelism(2).await?;
-    test_sink
-        .store
-        .wait_for_count(test_source.id_list.len())
-        .await?;
-    session.run("flush").await?;
-
-    let internal_tables = session.run("show internal tables").await?;
-    let table_name_prefix = "public.__internal_test_sink_";
-    let error_table_name = internal_tables
-        .lines()
-        .find(|line| {
-            line.contains(table_name_prefix) && line.to_ascii_lowercase().contains("sinkerror")
-        })
-        .ok_or_else(|| anyhow::anyhow!("failed to find sink error internal table"))?
-        .to_owned();
-
-    let expected_count = test_source.id_list.len();
-    let count_sql = format!("select count(*) from {}", error_table_name);
-    let count_result = loop {
-        let count_result = session.run(&count_sql).await?;
-        if count_result.trim() == expected_count.to_string() {
-            break count_result;
-        }
-        sleep(Duration::from_millis(100)).await;
-    };
-    assert_eq!(count_result.trim(), expected_count.to_string());
-
-    let rows = session
+    let initial_ids = 0..5;
+    session
         .run(format!(
-            "select sink_error_row_op, id, name from {} order by id",
-            error_table_name
+            "insert into {} values {}",
+            "test_table_error",
+            format_insert_rows(
+                initial_ids
+                    .clone()
+                    .map(|id| (id, simple_name_of_id(id), None))
+            )
         ))
         .await?;
-    let expected_rows = test_source
-        .id_list
-        .iter()
-        .sorted()
-        .map(|id| format!("1 {} {}", id, simple_name_of_id(*id)))
+    test_sink.store.wait_for_count(initial_ids.len()).await?;
+
+    session.run("flush").await?;
+    let initial_error_table_name =
+        find_latest_error_table_name(&mut session, "test_sink_error").await?;
+    wait_for_error_table_count(&mut session, &initial_error_table_name, initial_ids.len()).await?;
+
+    let initial_rows = session
+        .run(format!(
+            "select sink_error_row_op, id, name, \
+                    sink_error_extra_info->>'id', \
+                    sink_error_extra_info->>'name', \
+                    sink_error_extra_info->>'column_count' \
+             from {} order by id",
+            initial_error_table_name
+        ))
+        .await?;
+    let expected_initial_rows = initial_ids
+        .clone()
+        .map(|id| {
+            let name = simple_name_of_id(id);
+            format!("1 {} {} {} {} 2", id, name, id, name)
+        })
         .join("\n");
+    assert_eq!(initial_rows.trim(), expected_initial_rows);
+
+    session
+        .run("alter table test_table_error add column age int")
+        .await?;
+
+    let new_ids = 5..10;
+    session
+        .run(format!(
+            "insert into {} values {}",
+            "test_table_error",
+            format_insert_rows(new_ids.clone().map(|id| {
+                let age = id + 100;
+                (id, simple_name_of_id(id), Some(age))
+            }))
+        ))
+        .await?;
+    test_sink.store.wait_for_count(new_ids.end as usize).await?;
+
+    session.run("flush").await?;
+    let latest_error_table_name =
+        find_latest_error_table_name(&mut session, "test_sink_error").await?;
+    let expected_row_count = if latest_error_table_name == initial_error_table_name {
+        new_ids.end as usize
+    } else {
+        new_ids.len()
+    };
+    wait_for_error_table_count(&mut session, &latest_error_table_name, expected_row_count).await?;
+
+    let mut verify_session = cluster.start_session();
+    let rows =
+        query_error_table_rows_with_age(&mut verify_session, &latest_error_table_name).await?;
+    let expected_rows = if latest_error_table_name == initial_error_table_name {
+        initial_ids
+            .clone()
+            .map(|id| format!("1 {} {} NULL 2", id, simple_name_of_id(id)))
+            .chain(
+                new_ids
+                    .clone()
+                    .map(|id| format!("1 {} {} {} 3", id, simple_name_of_id(id), id + 100)),
+            )
+            .join("\n")
+    } else {
+        new_ids
+            .clone()
+            .map(|id| format!("1 {} {} {} 3", id, simple_name_of_id(id), id + 100))
+            .join("\n")
+    };
     assert_eq!(rows.trim(), expected_rows);
 
-    session.run(DROP_SINK).await?;
-    session.run(DROP_SOURCE).await?;
+    session.run("drop sink test_sink_error").await?;
+    session.run("drop table test_table_error").await?;
     assert_eq!(
         0,
         test_sink
@@ -113,4 +235,14 @@ async fn test_sink_error_table() -> Result<()> {
             .load(std::sync::atomic::Ordering::Relaxed)
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn test_sink_error_table_nondecouple() -> Result<()> {
+    run_sink_error_table_test(false).await
+}
+
+#[tokio::test]
+async fn test_sink_error_table_decouple() -> Result<()> {
+    run_sink_error_table_test(true).await
 }

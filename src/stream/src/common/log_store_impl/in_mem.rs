@@ -580,6 +580,7 @@ mod tests {
                         Some(ScalarImpl::Utf8("alice".into())),
                         Some(ScalarImpl::Int32(7)),
                     ]),
+                    extra_info: None,
                 }],
             )
             .unwrap();

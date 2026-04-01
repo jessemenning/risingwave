@@ -29,6 +29,7 @@ use risingwave_common::bail;
 use risingwave_common::bitmap::Bitmap;
 use risingwave_common::metrics::{LabelGuardedIntCounter, LabelGuardedIntGauge};
 use risingwave_common::row::OwnedRow;
+use risingwave_common::types::JsonbVal;
 use risingwave_common::util::epoch::{EpochPair, INVALID_EPOCH};
 use risingwave_common_estimate_size::EstimateSize;
 use risingwave_common_rate_limit::{RateLimit, RateLimiter};
@@ -155,6 +156,7 @@ pub struct FlushCurrentEpochOptions {
 pub struct ReportedSinkErrorRow {
     pub op: Op,
     pub row: OwnedRow,
+    pub extra_info: Option<JsonbVal>,
 }
 
 #[derive(Clone, Debug)]

@@ -81,11 +81,12 @@ impl PendingErrorRows {
         let next_row_id = self.next_row_id_by_epoch.entry(reported.epoch).or_insert(0);
         let rows = self.rows_by_epoch.entry(reported.epoch).or_default();
         for reported_row in reported.rows {
-            let mut values = Vec::with_capacity(reported_row.row.as_inner().len() + 4);
+            let mut values = Vec::with_capacity(reported_row.row.as_inner().len() + 5);
             values.push(Some(ScalarImpl::Int64(reported.epoch as i64)));
             values.push(Some(ScalarImpl::Int32(*next_row_id)));
             values.push(Some(ScalarImpl::Int16(vnode)));
             values.push(Some(ScalarImpl::Int16(reported_row.op.to_i16())));
+            values.push(reported_row.extra_info.map(ScalarImpl::Jsonb));
             values.extend(reported_row.row.into_inner().into_vec());
             rows.push(OwnedRow::new(values));
             *next_row_id += 1;
@@ -108,6 +109,18 @@ impl PendingErrorRows {
         }
         rows
     }
+}
+
+fn select_error_vnode(error_table: Option<&StateTable<impl StateStore>>, actor_id: ActorId) -> i16 {
+    let Some(vnodes) = error_table.map(StateTable::vnodes) else {
+        return 0;
+    };
+    let vnode_count = vnodes.count_ones();
+    if vnode_count == 0 {
+        return 0;
+    }
+    let vnode_idx = actor_id.as_raw_id() as usize % vnode_count;
+    vnodes.iter_ones().nth(vnode_idx).unwrap_or(0) as i16
 }
 
 // Drop all the DELETE messages in this chunk and convert UPDATE INSERT into INSERT.
@@ -628,10 +641,7 @@ impl<F: LogStoreFactory, S: StateStore> SinkExecutor<F, S> {
             error_table.init_epoch(init_epoch).await?;
         }
 
-        let error_vnode = error_table
-            .as_ref()
-            .and_then(|table| table.vnodes().iter_ones().next())
-            .unwrap_or_default() as i16;
+        let error_vnode = select_error_vnode(error_table.as_ref(), actor_id);
         let mut pending_error_rows = PendingErrorRows {
             rows_by_epoch: HashMap::new(),
             next_row_id_by_epoch: HashMap::new(),

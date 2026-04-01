@@ -33,7 +33,7 @@ use rand::{Rng, rng as thread_rng};
 use risingwave_common::array::{Op, StreamChunk};
 use risingwave_common::catalog::Field;
 use risingwave_common::row::Row;
-use risingwave_common::types::{DataType, ScalarImpl};
+use risingwave_common::types::{DataType, JsonbVal, ScalarImpl};
 use risingwave_common::util::chunk_coalesce::DataChunkBuilder;
 use risingwave_connector::sink::boxed::{BoxLogSinker, DynLogReader};
 use risingwave_connector::sink::coordinate::CoordinatedLogSinker;
@@ -691,16 +691,24 @@ impl SimulationTestSink {
                                             let mut reported_error_rows = vec![];
                                             for (op, row) in chunk.rows() {
                                                 assert_eq!(op, Op::Insert);
+                                                assert!(row.len() >= 2);
                                                 let id = row.datum_at(0).unwrap().into_int32();
                                                 let name = row
                                                     .datum_at(1)
                                                     .unwrap()
                                                     .into_utf8()
                                                     .to_string();
-                                                store.insert(id, name);
+                                                store.insert(id, name.clone());
                                                 reported_error_rows.push(ReportedSinkErrorRow {
                                                     op,
                                                     row: row.to_owned_row(),
+                                                    extra_info: Some(JsonbVal::from(
+                                                        serde_json::json!({
+                                                            "id": id,
+                                                            "name": name,
+                                                            "column_count": row.len(),
+                                                        }),
+                                                    )),
                                                 });
                                             }
                                             log_reader.truncate(

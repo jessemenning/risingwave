@@ -367,12 +367,13 @@ impl LogStoreBufferSender {
     pub(crate) async fn wait_for_barrier_truncation(
         &self,
         curr_epoch: u64,
-    ) -> LogStoreResult<ReaderTruncationOffsetType> {
+    ) -> LogStoreResult<(ReaderTruncationOffsetType, Vec<ReportedSinkErrorRows>)> {
         loop {
             let notified = self.truncate_notify.notified();
 
             {
                 let mut inner = self.buffer.inner();
+                let mut reported_error_rows = vec![];
                 while let Some(progress) = inner.truncation_list.pop_front() {
                     let (epoch, seq_id) = progress.offset;
                     if epoch > curr_epoch {
@@ -383,8 +384,14 @@ impl LogStoreBufferSender {
                             curr_epoch
                         ));
                     }
+                    if !progress.reported_error_rows.is_empty() {
+                        reported_error_rows.push(ReportedSinkErrorRows {
+                            epoch,
+                            rows: progress.reported_error_rows,
+                        });
+                    }
                     if epoch == curr_epoch && seq_id.is_none() {
-                        return Ok((epoch, seq_id));
+                        return Ok(((epoch, seq_id), reported_error_rows));
                     }
                 }
             }

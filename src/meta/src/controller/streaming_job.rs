@@ -1847,6 +1847,31 @@ impl CatalogController {
                         )),
                     });
                 }
+                if let Some((error_table_id, new_error_table_columns)) =
+                    finish_sink_context.new_error_table
+                {
+                    let new_error_table_columns: ColumnCatalogArray =
+                        new_error_table_columns.into();
+                    let (mut table, table_obj) = Table::find_by_id(error_table_id)
+                        .find_also_related(Object)
+                        .one(txn)
+                        .await?
+                        .ok_or_else(|| MetaError::catalog_id_not_found("table", original_job_id))?;
+                    Table::update(table::ActiveModel {
+                        table_id: Set(error_table_id),
+                        columns: Set(new_error_table_columns.clone()),
+                        ..Default::default()
+                    })
+                    .exec(txn)
+                    .await?;
+                    table.columns = new_error_table_columns;
+                    objects.push(PbObject {
+                        object_info: Some(PbObjectInfo::Table(
+                            ObjectModel(table, table_obj.unwrap(), sink_streaming_job.clone())
+                                .into(),
+                        )),
+                    });
+                }
             }
         }
 
@@ -3400,6 +3425,7 @@ pub struct FinishAutoRefreshSchemaSinkContext {
     pub original_sink_id: SinkId,
     pub columns: Vec<PbColumnCatalog>,
     pub new_log_store_table: Option<(TableId, Vec<PbColumnCatalog>)>,
+    pub new_error_table: Option<(TableId, Vec<PbColumnCatalog>)>,
 }
 
 async fn update_connector_props_fragments<F>(

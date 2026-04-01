@@ -505,8 +505,8 @@ mod tests {
     use itertools::Itertools;
     use risingwave_common::catalog::{ColumnCatalog, ColumnDesc};
     use risingwave_common::constants::sink_error::{
-        EPOCH_COLUMN_NAME, PREDEFINED_COLUMNS, ROW_ID_COLUMN_NAME, ROW_OP_COLUMN_NAME,
-        VNODE_COLUMN_INDEX, VNODE_COLUMN_NAME,
+        EPOCH_COLUMN_NAME, EXTRA_INFO_COLUMN_NAME, PREDEFINED_COLUMNS, ROW_ID_COLUMN_NAME,
+        ROW_OP_COLUMN_NAME, VNODE_COLUMN_INDEX, VNODE_COLUMN_NAME,
     };
     use risingwave_common::types::DataType;
 
@@ -540,6 +540,7 @@ mod tests {
                 ROW_ID_COLUMN_NAME,
                 VNODE_COLUMN_NAME,
                 ROW_OP_COLUMN_NAME,
+                EXTRA_INFO_COLUMN_NAME,
                 "name",
                 "id",
             ]

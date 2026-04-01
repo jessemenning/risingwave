@@ -753,7 +753,8 @@ impl StreamSink {
         infer_kv_log_store_table_catalog_inner(&self.input, &self.sink_desc().columns)
     }
 
-    /// The error table schema is: | error epoch | error row id | vnode | row op | visible sink columns |
+    /// The error table schema is:
+    /// | error epoch | error row id | vnode | row op | extra info | visible sink columns |
     /// Pk is: | error epoch | vnode | error row id |
     fn infer_sink_error_table_catalog(&self) -> TableCatalog {
         infer_sink_error_table_catalog_inner(self.sink_desc().columns.as_slice())
