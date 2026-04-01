@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use risingwave_common::bail;
+use thiserror_ext::AsReport;
 
 use super::simd_json_parser::DebeziumJsonAccessBuilder;
 use super::{DebeziumAvroAccessBuilder, DebeziumAvroParserConfig};
@@ -135,7 +136,7 @@ async fn resolve_postgres_composite_columns(
         Ok(client) => client,
         Err(err) => {
             tracing::warn!(
-                error = %err,
+                error = %err.as_report(),
                 "failed to connect postgres for composite metadata discovery; falling back to no decode columns"
             );
             return HashSet::new();
@@ -159,7 +160,7 @@ async fn resolve_postgres_composite_columns(
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!(
-                error = %err,
+                error = %err.as_report(),
                 schema,
                 table,
                 "failed to query postgres composite columns; falling back to no decode columns"
