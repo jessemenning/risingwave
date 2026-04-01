@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use risingwave_common::bail;
 
 use super::simd_json_parser::DebeziumJsonAccessBuilder;
 use super::{DebeziumAvroAccessBuilder, DebeziumAvroParserConfig};
+use crate::connector_common::create_pg_client;
+use crate::connector_common::postgres::SslMode;
 use crate::error::ConnectorResult;
 use crate::parser::unified::debezium::DebeziumChangeEvent;
 use crate::parser::unified::json::{
@@ -28,7 +30,7 @@ use crate::parser::{
     AccessBuilderImpl, ByteStreamSourceParser, EncodingProperties, EncodingType, ParseResult,
     ParserFormat, ProtocolProperties, SourceStreamChunkRowWriter, SpecificParserConfig,
 };
-use crate::source::{SourceColumnDesc, SourceContext, SourceContextRef};
+use crate::source::{ConnectorProperties, SourceColumnDesc, SourceContext, SourceContextRef};
 
 #[derive(Debug)]
 pub struct DebeziumParser {
@@ -62,6 +64,8 @@ impl DebeziumProps {
 async fn build_accessor_builder(
     config: EncodingProperties,
     encoding_type: EncodingType,
+    decode_unknown_composite_base64: bool,
+    composite_text_columns: HashSet<String>,
 ) -> ConnectorResult<AccessBuilderImpl> {
     match config {
         EncodingProperties::Avro(_) => {
@@ -82,11 +86,99 @@ async fn build_accessor_builder(
                 json_config
                     .bigint_unsigned_handling
                     .unwrap_or(BigintUnsignedHandlingMode::Long),
+                decode_unknown_composite_base64,
+                composite_text_columns,
                 json_config.handle_toast_columns,
             )?,
         )),
         _ => bail!("unsupported encoding for Debezium"),
     }
+}
+
+async fn resolve_postgres_composite_columns(
+    connector_props: &ConnectorProperties,
+    rw_columns: &[SourceColumnDesc],
+) -> HashSet<String> {
+    let ConnectorProperties::PostgresCdc(cdc_props) = connector_props else {
+        return HashSet::new();
+    };
+
+    let props = &cdc_props.properties;
+    let schema = props.get("schema.name").map_or("public", String::as_str);
+    let Some(table) = props.get("table.name").map(String::as_str) else {
+        return HashSet::new();
+    };
+
+    let required_keys = ["username", "password", "hostname", "port", "database.name"];
+    if required_keys.iter().any(|k| !props.contains_key(*k)) {
+        return HashSet::new();
+    }
+
+    let ssl_mode = props
+        .get("ssl.mode")
+        .map_or(Ok(SslMode::Disabled), |v| v.parse())
+        .unwrap_or(SslMode::Disabled);
+    let ssl_root_cert = props.get("ssl.root.cert").cloned();
+
+    let client = match create_pg_client(
+        props.get("username").unwrap(),
+        props.get("password").unwrap(),
+        props.get("hostname").unwrap(),
+        props.get("port").unwrap(),
+        props.get("database.name").unwrap(),
+        &ssl_mode,
+        &ssl_root_cert,
+        None,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to connect postgres for composite metadata discovery; falling back to no decode columns"
+            );
+            return HashSet::new();
+        }
+    };
+
+    let query = r#"
+        SELECT a.attname
+        FROM pg_attribute a
+        JOIN pg_class c ON a.attrelid = c.oid
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        JOIN pg_type t ON a.atttypid = t.oid
+        WHERE n.nspname = $1
+          AND c.relname = $2
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND t.typtype = 'c'
+    "#;
+
+    let rows = match client.query(query, &[&schema, &table]).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                schema,
+                table,
+                "failed to query postgres composite columns; falling back to no decode columns"
+            );
+            return HashSet::new();
+        }
+    };
+
+    let rw_column_names = rw_columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect::<HashSet<_>>();
+
+    rows.into_iter()
+        .filter_map(|row| {
+            let col: String = row.get(0);
+            rw_column_names.contains(col.as_str()).then_some(col)
+        })
+        .collect::<HashSet<_>>()
 }
 
 impl DebeziumParser {
@@ -95,10 +187,36 @@ impl DebeziumParser {
         rw_columns: Vec<SourceColumnDesc>,
         source_ctx: SourceContextRef,
     ) -> ConnectorResult<Self> {
-        let key_builder =
-            build_accessor_builder(props.encoding_config.clone(), EncodingType::Key).await?;
-        let payload_builder =
-            build_accessor_builder(props.encoding_config, EncodingType::Value).await?;
+        let include_unknown_datatypes = matches!(
+            &props.encoding_config,
+            EncodingProperties::Json(json_config) if json_config.include_unknown_datatypes
+        );
+        let decode_unknown_composite_base64 = include_unknown_datatypes
+            && matches!(
+                &source_ctx.connector_props,
+                ConnectorProperties::PostgresCdc(_)
+            );
+
+        let composite_text_columns = if decode_unknown_composite_base64 {
+            resolve_postgres_composite_columns(&source_ctx.connector_props, &rw_columns).await
+        } else {
+            HashSet::new()
+        };
+
+        let key_builder = build_accessor_builder(
+            props.encoding_config.clone(),
+            EncodingType::Key,
+            false,
+            HashSet::new(),
+        )
+        .await?;
+        let payload_builder = build_accessor_builder(
+            props.encoding_config,
+            EncodingType::Value,
+            decode_unknown_composite_base64,
+            composite_text_columns,
+        )
+        .await?;
         let debezium_props = if let ProtocolProperties::Debezium(props) = props.protocol_config {
             props
         } else {
@@ -126,6 +244,7 @@ impl DebeziumParser {
                 timestamp_handling: None,
                 time_handling: None,
                 bigint_unsigned_handling: None,
+                include_unknown_datatypes: false,
                 handle_toast_columns: false,
             }),
             protocol_config: ProtocolProperties::Debezium(DebeziumProps::default()),
@@ -234,6 +353,7 @@ mod tests {
                 timestamp_handling: None,
                 time_handling: None,
                 bigint_unsigned_handling: None,
+                include_unknown_datatypes: false,
                 handle_toast_columns: false,
             }),
             protocol_config: ProtocolProperties::Debezium(DebeziumProps::default()),
@@ -310,6 +430,7 @@ mod tests {
                 timestamp_handling: None,
                 time_handling: None,
                 bigint_unsigned_handling: None,
+                include_unknown_datatypes: false,
                 handle_toast_columns: false,
             }),
             protocol_config: ProtocolProperties::Debezium(DebeziumProps::default()),

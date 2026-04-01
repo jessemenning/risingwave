@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
@@ -534,13 +535,6 @@ impl JsonParseOptions {
             // ---- Varchar -----
             (DataType::Varchar, ValueType::String) => {
                 let raw = value.as_str().unwrap();
-                // Fallback for Debezium unknown Postgres composite values that may still arrive
-                // as base64-encoded textual records like "(USD,66.66)".
-                if matches!(self.bytea_handling, ByteaHandling::Base64)
-                    && let Some(decoded) = try_decode_base64_composite_text(raw)
-                {
-                    return Ok(DatumCow::Owned(Some(ScalarImpl::Utf8(decoded.into()))));
-                }
                 return Ok(DatumCow::Borrowed(Some(raw.into())));
             }
             (
@@ -800,17 +794,40 @@ fn try_base64_decode_decimal(
 pub struct JsonAccess<'a> {
     value: BorrowedValue<'a>,
     options: &'a JsonParseOptions,
+    decode_unknown_composite_base64: bool,
+    composite_text_columns: &'a HashSet<String>,
 }
 
 impl<'a> JsonAccess<'a> {
     pub fn new_with_options(value: BorrowedValue<'a>, options: &'a JsonParseOptions) -> Self {
-        Self { value, options }
+        Self {
+            value,
+            options,
+            decode_unknown_composite_base64: false,
+            composite_text_columns: &EMPTY_COMPOSITE_TEXT_COLUMNS,
+        }
+    }
+
+    pub fn new_with_options_and_composite_columns(
+        value: BorrowedValue<'a>,
+        options: &'a JsonParseOptions,
+        decode_unknown_composite_base64: bool,
+        composite_text_columns: &'a HashSet<String>,
+    ) -> Self {
+        Self {
+            value,
+            options,
+            decode_unknown_composite_base64,
+            composite_text_columns,
+        }
     }
 
     pub fn new(value: BorrowedValue<'a>) -> Self {
         Self::new_with_options(value, &JsonParseOptions::DEFAULT)
     }
 }
+
+static EMPTY_COMPOSITE_TEXT_COLUMNS: LazyLock<HashSet<String>> = LazyLock::new(HashSet::new);
 
 impl Access for JsonAccess<'_> {
     fn access<'a>(&'a self, path: &[&str], type_expected: &DataType) -> AccessResult<DatumCow<'a>> {
@@ -829,6 +846,17 @@ impl Access for JsonAccess<'_> {
                     path: path.iter().take(idx).join("."),
                 })?;
             }
+        }
+
+        if matches!(type_expected, DataType::Varchar)
+            && self.decode_unknown_composite_base64
+            && matches!(self.options.bytea_handling, ByteaHandling::Base64)
+            && let Some(column_name) = path.last()
+            && self.composite_text_columns.contains(*column_name)
+            && let Some(raw) = value.as_str()
+            && let Some(decoded) = try_decode_base64_composite_text(raw)
+        {
+            return Ok(DatumCow::Owned(Some(ScalarImpl::Utf8(decoded.into()))));
         }
 
         self.options.parse(value, type_expected)

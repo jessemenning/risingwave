@@ -115,6 +115,7 @@ impl SpecificParserConfig {
             timestamptz_handling: None,
             time_handling: None,
             bigint_unsigned_handling: None,
+            include_unknown_datatypes: false,
             handle_toast_columns: false,
         }),
         protocol_config: ProtocolProperties::Plain,
@@ -295,6 +296,9 @@ impl SpecificParserConfig {
                 )?,
                 time_handling: None,
                 bigint_unsigned_handling: None,
+                include_unknown_datatypes: format_encode_options_with_secret
+                    .get("debezium.include.unknown.datatypes")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("true")),
                 handle_toast_columns: false,
             }),
             (SourceFormat::DebeziumMongo, SourceEncode::Json) => {
@@ -386,6 +390,7 @@ pub struct JsonProperties {
     pub timestamptz_handling: Option<TimestamptzHandling>,
     pub time_handling: Option<TimeHandling>,
     pub bigint_unsigned_handling: Option<BigintUnsignedHandlingMode>,
+    pub include_unknown_datatypes: bool,
     pub handle_toast_columns: bool,
 }
 

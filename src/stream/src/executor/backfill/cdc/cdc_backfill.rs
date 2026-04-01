@@ -23,6 +23,7 @@ use itertools::Itertools;
 use risingwave_common::array::DataChunk;
 use risingwave_common::bail;
 use risingwave_common::catalog::ColumnDesc;
+use risingwave_connector::WithOptionsSecResolved;
 use risingwave_connector::parser::{
     BigintUnsignedHandlingMode, ByteStreamSourceParser, DebeziumParser, DebeziumProps,
     EncodingProperties, JsonProperties, ProtocolProperties, SourceStreamChunkBuilder,
@@ -32,7 +33,9 @@ use risingwave_connector::source::cdc::CdcScanOptions;
 use risingwave_connector::source::cdc::external::{
     CdcOffset, ExternalCdcTableType, ExternalTableReaderImpl,
 };
-use risingwave_connector::source::{SourceColumnDesc, SourceContext, SourceCtrlOpts};
+use risingwave_connector::source::{
+    ConnectorProperties, SourceColumnDesc, SourceContext, SourceCtrlOpts,
+};
 use risingwave_pb::common::ThrottleType;
 use rw_futures_util::pausable;
 use thiserror_ext::AsReport;
@@ -54,6 +57,16 @@ use crate::task::CreateMviewProgressReporter;
 
 /// `split_id`, `is_finished`, `row_count`, `cdc_offset` all occupy 1 column each.
 const METADATA_STATE_LEN: usize = 4;
+
+#[derive(Clone, Debug)]
+pub struct TransformUpstreamOptions {
+    pub timestamp_handling: Option<TimestampHandling>,
+    pub timestamptz_handling: Option<TimestamptzHandling>,
+    pub time_handling: Option<TimeHandling>,
+    pub bigint_unsigned_handling: Option<BigintUnsignedHandlingMode>,
+    pub handle_toast_columns: bool,
+    pub properties: BTreeMap<String, String>,
+}
 
 pub struct CdcBackfillExecutor<S: StateStore> {
     actor_ctx: ActorContextRef,
@@ -240,11 +253,14 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
         let mut upstream = transform_upstream(
             upstream,
             self.output_columns.clone(),
-            timestamp_handling,
-            timestamptz_handling,
-            time_handling,
-            bigint_unsigned_handling,
-            handle_toast_columns,
+            TransformUpstreamOptions {
+                timestamp_handling,
+                timestamptz_handling,
+                time_handling,
+                bigint_unsigned_handling,
+                handle_toast_columns,
+                properties: self.properties.clone(),
+            },
         )
         .boxed();
         loop {
@@ -836,12 +852,20 @@ pub(crate) async fn build_reader_and_poll_upstream(
 pub async fn transform_upstream(
     upstream: BoxedMessageStream,
     output_columns: Vec<ColumnDesc>,
-    timestamp_handling: Option<TimestampHandling>,
-    timestamptz_handling: Option<TimestamptzHandling>,
-    time_handling: Option<TimeHandling>,
-    bigint_unsigned_handling: Option<BigintUnsignedHandlingMode>,
-    handle_toast_columns: bool,
+    options: TransformUpstreamOptions,
 ) {
+    let TransformUpstreamOptions {
+        timestamp_handling,
+        timestamptz_handling,
+        time_handling,
+        bigint_unsigned_handling,
+        handle_toast_columns,
+        properties,
+    } = options;
+
+    let include_unknown_datatypes = properties
+        .get("debezium.include.unknown.datatypes")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
     let props = SpecificParserConfig {
         encoding_config: EncodingProperties::Json(JsonProperties {
             use_schema_registry: false,
@@ -849,6 +873,7 @@ pub async fn transform_upstream(
             timestamptz_handling,
             time_handling,
             bigint_unsigned_handling,
+            include_unknown_datatypes,
             handle_toast_columns,
         }),
         // the cdc message is generated internally so the key must exist.
@@ -860,10 +885,25 @@ pub async fn transform_upstream(
         .iter()
         .map(SourceColumnDesc::from)
         .collect_vec();
+    let connector_props = ConnectorProperties::extract(
+        WithOptionsSecResolved::without_secrets(properties),
+        false,
+    )
+    .unwrap_or_else(|err| {
+        tracing::warn!(
+            error = %err.as_report(),
+            "failed to extract connector properties for cdc backfill transform; falling back to dummy connector props"
+        );
+        ConnectorProperties::default()
+    });
+
     let mut parser = DebeziumParser::new(
         props,
         columns_with_meta.clone(),
-        Arc::new(SourceContext::dummy()),
+        Arc::new(SourceContext {
+            connector_props,
+            ..SourceContext::dummy()
+        }),
     )
     .await
     .map_err(StreamExecutorError::connector_error)?;
@@ -960,7 +1000,9 @@ mod tests {
     use risingwave_connector::source::cdc::CdcScanOptions;
     use risingwave_storage::memory::MemoryStateStore;
 
-    use crate::executor::backfill::cdc::cdc_backfill::transform_upstream;
+    use crate::executor::backfill::cdc::cdc_backfill::{
+        TransformUpstreamOptions, transform_upstream,
+    };
     use crate::executor::monitor::StreamingMetrics;
     use crate::executor::prelude::StateTable;
     use crate::executor::source::default_source_internal_table;
@@ -1015,7 +1057,18 @@ mod tests {
             ColumnDesc::named("commit_ts", ColumnId::new(6), DataType::Timestamptz),
         ];
 
-        let parsed_stream = transform_upstream(upstream, columns, None, None, None, None, false);
+        let parsed_stream = transform_upstream(
+            upstream,
+            columns,
+            TransformUpstreamOptions {
+                timestamp_handling: None,
+                timestamptz_handling: None,
+                time_handling: None,
+                bigint_unsigned_handling: None,
+                handle_toast_columns: false,
+                properties: BTreeMap::new(),
+            },
+        );
         pin_mut!(parsed_stream);
         // the output chunk must contain the offset column
         if let Some(message) = parsed_stream.next().await {

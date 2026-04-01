@@ -38,7 +38,7 @@ use tracing::Instrument;
 
 use crate::executor::UpdateMutation;
 use crate::executor::backfill::cdc::cdc_backfill::{
-    build_reader_and_poll_upstream, transform_upstream,
+    TransformUpstreamOptions, build_reader_and_poll_upstream, transform_upstream,
 };
 use crate::executor::backfill::cdc::state_v2::ParallelizedCdcBackfillState;
 use crate::executor::backfill::cdc::upstream_table::external::ExternalStorageTable;
@@ -168,11 +168,14 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
         let mut upstream = transform_upstream(
             upstream,
             self.output_columns.clone(),
-            timestamp_handling,
-            timestamptz_handling,
-            time_handling,
-            bigint_unsigned_handling,
-            handle_toast_columns,
+            TransformUpstreamOptions {
+                timestamp_handling,
+                timestamptz_handling,
+                time_handling,
+                bigint_unsigned_handling,
+                handle_toast_columns,
+                properties: self.properties.clone(),
+            },
         )
         .boxed();
         let mut next_reset_barrier = Some(first_barrier);

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::fmt::Debug;
 
 use anyhow::Context;
@@ -31,6 +32,8 @@ use crate::parser::{AccessBuilder, MongoProperties};
 pub struct DebeziumJsonAccessBuilder {
     value: Option<Vec<u8>>,
     json_parse_options: JsonParseOptions,
+    decode_unknown_composite_base64: bool,
+    composite_text_columns: HashSet<String>,
 }
 
 impl DebeziumJsonAccessBuilder {
@@ -39,6 +42,8 @@ impl DebeziumJsonAccessBuilder {
         timestamp_handling: TimestampHandling,
         time_handling: TimeHandling,
         bigint_unsigned_handling: BigintUnsignedHandlingMode,
+        decode_unknown_composite_base64: bool,
+        composite_text_columns: HashSet<String>,
         handle_toast_columns: bool,
     ) -> ConnectorResult<Self> {
         Ok(Self {
@@ -50,6 +55,8 @@ impl DebeziumJsonAccessBuilder {
                 bigint_unsigned_handling,
                 handle_toast_columns,
             ),
+            decode_unknown_composite_base64,
+            composite_text_columns,
         })
     }
 
@@ -57,6 +64,8 @@ impl DebeziumJsonAccessBuilder {
         Ok(Self {
             value: None,
             json_parse_options: JsonParseOptions::default(),
+            decode_unknown_composite_base64: false,
+            composite_text_columns: HashSet::new(),
         })
     }
 }
@@ -79,10 +88,14 @@ impl AccessBuilder for DebeziumJsonAccessBuilder {
             event
         };
 
-        Ok(AccessImpl::Json(JsonAccess::new_with_options(
-            payload,
-            &self.json_parse_options,
-        )))
+        Ok(AccessImpl::Json(
+            JsonAccess::new_with_options_and_composite_columns(
+                payload,
+                &self.json_parse_options,
+                self.decode_unknown_composite_base64,
+                &self.composite_text_columns,
+            ),
+        ))
     }
 }
 
@@ -173,6 +186,7 @@ mod tests {
                 timestamp_handling: None,
                 time_handling: None,
                 bigint_unsigned_handling: None,
+                include_unknown_datatypes: false,
                 handle_toast_columns: false,
             }),
             protocol_config: ProtocolProperties::Debezium(DebeziumProps::default()),

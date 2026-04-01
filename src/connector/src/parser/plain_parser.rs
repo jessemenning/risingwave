@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
+
 use risingwave_common::bail;
 use thiserror_ext::AsReport;
 
@@ -77,6 +79,8 @@ impl PlainParser {
                 TimestampHandling::GuessNumberUnit,
                 TimeHandling::Micro,
                 BigintUnsignedHandlingMode::Long,
+                false,
+                HashSet::new(),
                 false,
             )?,
         ));
