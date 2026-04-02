@@ -280,9 +280,9 @@ impl JsonParseOptions {
                 string_parsing: false,
                 string_integer_parsing: false,
             },
-            // For Debezium CDC payloads, allow non-string values (object/array/etc.)
-            // for VARCHAR columns and preserve them via stringification.
-            varchar_handling: VarcharHandling::AllTypes,
+            // Keep Debezium VARCHAR parsing strict by default and rely on
+            // column-targeted composite fallback decode when enabled.
+            varchar_handling: VarcharHandling::Strict,
             struct_handling: StructHandling::Strict,
             bigint_unsigned_handling,
             ignoring_keycase: true,
