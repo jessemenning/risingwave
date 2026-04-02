@@ -48,33 +48,6 @@ pub struct ChangeBufferExecutor<S: StateStore> {
     buffer_max_rows: usize,
 }
 
-#[derive(Debug, Default)]
-struct EpochChunkBuffer {
-    chunks: VecDeque<StreamChunk>,
-    row_count: usize,
-}
-
-impl EpochChunkBuffer {
-    fn push_chunk(&mut self, chunk: StreamChunk) {
-        self.row_count += chunk.cardinality();
-        self.chunks.push_back(chunk);
-    }
-
-    fn exceeds(&self, threshold: usize) -> bool {
-        self.row_count >= threshold
-    }
-
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
-    }
-
-    fn drain(&mut self) -> impl Iterator<Item = StreamChunk> + '_ {
-        self.row_count = 0;
-        self.chunks.drain(..)
-    }
-}
-
 impl<S: StateStore> ChangeBufferExecutor<S> {
     pub fn new(
         actor_context: ActorContextRef,
@@ -114,7 +87,7 @@ impl<S: StateStore> ChangeBufferExecutor<S> {
                 },
                 is_replicated: false,
                 vnodes,
-                upload_on_flush: true,
+                upload_on_flush: false,
             })
             .await;
         local_store.init(InitOptions::new(epoch)).await?;
