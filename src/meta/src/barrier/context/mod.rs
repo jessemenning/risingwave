@@ -15,11 +15,12 @@
 mod context_impl;
 pub(crate) mod recovery;
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use risingwave_common::catalog::DatabaseId;
+use risingwave_common::catalog::{DatabaseId, TableId};
 use risingwave_common::id::JobId;
 use risingwave_pb::common::WorkerNode;
 use risingwave_pb::hummock::HummockVersionStats;
@@ -30,6 +31,7 @@ use risingwave_pb::stream_service::streaming_control_stream_request::PbInitReque
 use risingwave_rpc_client::StreamingControlHandle;
 
 use crate::MetaResult;
+use crate::barrier::checkpoint::BatchRefreshJobCachedContext;
 use crate::barrier::command::PostCollectCommand;
 use crate::barrier::progress::TrackingJob;
 use crate::barrier::schedule::{MarkReadyOptions, ScheduledBarriers};
@@ -72,6 +74,8 @@ impl CreateSnapshotBackfillJobCommandInfo {
         }
     }
 }
+
+pub(crate) type BatchRefreshResolvedEpochs = (HashMap<TableId, Vec<(Vec<u64>, u64)>>, u64);
 
 pub(super) trait GlobalBarrierWorkerContext: Send + Sync + 'static {
     fn commit_epoch(
@@ -131,6 +135,26 @@ pub(super) trait GlobalBarrierWorkerContext: Send + Sync + 'static {
         &self,
         refresh_finished_table_job_ids: Vec<JobId>,
     ) -> impl Future<Output = MetaResult<()>> + Send + '_;
+
+    /// Fetch upstream table log epochs from hummock for a batch refresh trigger.
+    ///
+    /// Returns `(upstream_table_log_epochs, target_upstream_epoch)`:
+    /// - `upstream_table_log_epochs`: log epoch ranges for each upstream table
+    /// - `target_upstream_epoch`: the committed epoch of the upstream tables
+    fn resolve_batch_refresh_upstream_log_epochs(
+        &self,
+        upstream_table_ids: HashSet<TableId>,
+        last_committed_epoch: u64,
+    ) -> impl Future<Output = MetaResult<BatchRefreshResolvedEpochs>> + Send + '_;
+
+    /// Load the cached context for a recovered batch refresh job that has
+    /// `cached_context: None`. Reads fragment definitions, job model, and
+    /// database resource group from the metadata store.
+    fn load_batch_refresh_cached_context(
+        &self,
+        job_id: JobId,
+        database_id: DatabaseId,
+    ) -> impl Future<Output = MetaResult<BatchRefreshJobCachedContext>> + Send + '_;
 }
 
 pub(super) struct GlobalBarrierWorkerContextImpl {

@@ -19,7 +19,7 @@ use risingwave_common::util::epoch::EpochPair;
 use crate::barrier::partial_graph::PartialGraphStat;
 use crate::rpc::metrics::GLOBAL_META_METRICS;
 
-pub(super) struct CreatingStreamingJobBarrierStats {
+pub(crate) struct CreatingStreamingJobBarrierStats {
     consuming_snapshot_barrier_latency: LabelGuardedHistogram,
     consuming_log_store_barrier_latency: LabelGuardedHistogram,
     inflight_barrier_num: LabelGuardedIntGauge,
@@ -28,7 +28,7 @@ pub(super) struct CreatingStreamingJobBarrierStats {
 }
 
 impl CreatingStreamingJobBarrierStats {
-    pub(super) fn new(job_id: JobId, snapshot_epoch: u64) -> Self {
+    pub(crate) fn new(job_id: JobId, snapshot_epoch: u64) -> Self {
         let table_id_str = format!("{}", job_id);
         Self {
             snapshot_epoch,

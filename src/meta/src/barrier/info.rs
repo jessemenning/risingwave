@@ -342,12 +342,26 @@ impl SharedActorInfoWriter<'_> {
     }
 
     pub(super) fn remove(&mut self, info: &InflightFragmentInfo) {
+        self.remove_by_fragment_id(info.fragment_id);
+    }
+
+    pub(super) fn remove_by_fragment_id(&mut self, fragment_id: FragmentId) {
         if let Some(database) = self.write_guard.info.get_mut(&self.database_id)
-            && let Some(fragment) = database.remove(&info.fragment_id)
+            && let Some(fragment) = database.remove(&fragment_id)
         {
             self.deleted_fragment_mapping
                 .get_or_insert_default()
                 .push(rebuild_fragment_mapping(&fragment));
+        }
+    }
+
+    /// Remove a fragment from the barrier manager's tracking without sending a
+    /// delete notification to frontends.  Used when a batch-refresh job goes
+    /// idle: the actors are gone but the MV's streaming/serving vnode mappings
+    /// must remain so that queries can still resolve the fragment.
+    pub(super) fn remove_without_notification(&mut self, fragment_id: FragmentId) {
+        if let Some(database) = self.write_guard.info.get_mut(&self.database_id) {
+            database.remove(&fragment_id);
         }
     }
 

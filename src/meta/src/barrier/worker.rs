@@ -24,6 +24,7 @@ use arc_swap::ArcSwap;
 use futures::{TryFutureExt, pin_mut};
 use itertools::Itertools;
 use risingwave_common::catalog::DatabaseId;
+use risingwave_common::id::JobId;
 use risingwave_common::system_param::reader::SystemParamsRead;
 use risingwave_common::system_param::{AdaptiveParallelismStrategy, PAUSE_ON_NEXT_BOOTSTRAP_KEY};
 use risingwave_meta_model::WorkerId;
@@ -633,6 +634,17 @@ impl<C: GlobalBarrierWorkerContext> GlobalBarrierWorker<C> {
                                 self.context.mark_ready(MarkReadyOptions::Database(entering_running.database_id()));
                                 entering_running.enter();
                             }
+                            CheckpointControlEvent::BatchRefreshTrigger {
+                                database_id,
+                                job_id,
+                                upstream_committed_epoch,
+                            } => {
+                                self.handle_batch_refresh_trigger(
+                                    database_id,
+                                    job_id,
+                                    upstream_committed_epoch,
+                                ).await?;
+                            }
                         }
                     };
                     if let Err(e) = result {
@@ -781,6 +793,79 @@ impl<C: GlobalBarrierWorkerContext> GlobalBarrierWorker<C> {
                 }
             }
         }
+    }
+}
+
+impl<C: GlobalBarrierWorkerContext> GlobalBarrierWorker<C> {
+    /// Handle a batch refresh trigger: fetch log epochs from hummock and start a new run.
+    async fn handle_batch_refresh_trigger(
+        &mut self,
+        database_id: DatabaseId,
+        job_id: JobId,
+        upstream_committed_epoch: u64,
+    ) -> MetaResult<()> {
+        // Extract trigger info from the job (read-only access).
+        let Some((upstream_table_ids, last_committed_epoch)) = self
+            .checkpoint_control
+            .get_batch_refresh_trigger_info(database_id, job_id, upstream_committed_epoch)
+        else {
+            return Ok(()); // Job not idle or not ready, skip.
+        };
+
+        // If the cached context is missing (recovered idle job), load it from metadata store.
+        if !self
+            .checkpoint_control
+            .has_batch_refresh_cached_context(database_id, job_id)
+        {
+            info!(
+                %database_id,
+                %job_id,
+                "batch refresh job: loading cached context for recovered idle job"
+            );
+            let cached_context = self
+                .context
+                .load_batch_refresh_cached_context(job_id, database_id)
+                .await?;
+            self.checkpoint_control.set_batch_refresh_cached_context(
+                database_id,
+                job_id,
+                cached_context,
+            );
+        }
+
+        // Fetch log epochs from hummock (async operation — no borrow on checkpoint_control).
+        let (upstream_table_log_epochs, target_upstream_epoch) = self
+            .context
+            .resolve_batch_refresh_upstream_log_epochs(upstream_table_ids, last_committed_epoch)
+            .await?;
+
+        // Collect worker_nodes from active streaming nodes.
+        let worker_nodes: HashMap<WorkerId, WorkerNode> = self
+            .active_streaming_nodes
+            .current()
+            .iter()
+            .map(|(worker_id, worker)| (*worker_id, worker.clone()))
+            .collect();
+
+        // Start the refresh run (mutable access to checkpoint_control).
+        self.checkpoint_control.start_batch_refresh_run(
+            database_id,
+            job_id,
+            upstream_committed_epoch,
+            &upstream_table_log_epochs,
+            target_upstream_epoch,
+            &worker_nodes,
+            self.env.actor_id_generator(),
+            self.adaptive_parallelism_strategy,
+            &mut self.partial_graph_manager,
+        )?;
+
+        info!(
+            %database_id,
+            %job_id,
+            "batch refresh job: started logstore run"
+        );
+        Ok(())
     }
 }
 
@@ -1145,7 +1230,7 @@ impl<C: GlobalBarrierWorkerContext> GlobalBarrierWorker<C> {
                                         assert!(failed_databases.insert(database_id, resetting_partial_graphs).is_none());
                                     } else if let Some(database) = collected_databases.remove(&database_id) {
                                         warn!(%database_id, %worker_id, "database initialized but later reset during global recovery");
-                                        let resetting_partial_graphs: HashSet<_> = database_partial_graphs(database_id, database.independent_checkpoint_job_controls.keys().copied()).collect();
+                                        let resetting_partial_graphs: HashSet<_> = database_partial_graphs(database_id, database.creating_streaming_job_controls.keys().copied().chain(database.batch_refresh_job_controls.keys().copied())).collect();
                                         partial_graph_manager.reset_partial_graphs(resetting_partial_graphs.iter().copied());
                                         assert!(failed_databases.insert(database_id, resetting_partial_graphs).is_none());
                                     } else {

@@ -42,8 +42,8 @@ use tracing::warn;
 use crate::MetaResult;
 use crate::barrier::cdc_progress::CdcTableBackfillTracker;
 use crate::barrier::checkpoint::{
-    BatchRefreshJobCheckpointControl, CreatingStreamingJobControl, DatabaseCheckpointControl,
-    IndependentCheckpointJobControl,
+    BatchRefreshJobCheckpointControl, BatchRefreshJobInfo, CreatingStreamingJobControl,
+    DatabaseCheckpointControl,
 };
 use crate::barrier::command::{CreateStreamingJobCommandInfo, PostCollectCommand, ReschedulePlan};
 use crate::barrier::context::CreateSnapshotBackfillJobCommandInfo;
@@ -261,7 +261,7 @@ pub(crate) fn resolve_no_shuffle_ensembles(
 /// 1. For each ensemble, resolve `EnsembleActorTemplate` (from existing or fresh).
 /// 2. For each new component fragment, allocate actor IDs and compute worker/vnode assignments.
 /// 3. Expand the simple assignments into full `StreamActor` structures.
-pub(super) fn render_actors(
+pub(crate) fn render_actors(
     fragments: &StreamJobFragmentsToCreate,
     database_info: &InflightDatabaseInfo,
     definition: &str,
@@ -562,8 +562,7 @@ impl DatabaseCheckpointControl {
                         &self.database_info,
                     )?;
 
-                    let Entry::Vacant(entry) =
-                        self.independent_checkpoint_job_controls.entry(job_id)
+                    let Entry::Vacant(entry) = self.creating_streaming_job_controls.entry(job_id)
                     else {
                         panic!("duplicated creating snapshot backfill job {job_id}");
                     };
@@ -587,12 +586,9 @@ impl DatabaseCheckpointControl {
                         &actors,
                     )?;
 
-                    if let Some(fragment_infos) = job.fragment_infos() {
-                        self.database_info.shared_actor_infos.upsert(
-                            self.database_id,
-                            fragment_infos.values().map(|f| (f, job_id)),
-                        );
-                    }
+                    self.database_info
+                        .shared_actor_infos
+                        .upsert(self.database_id, job.fragment_infos_with_job_id());
 
                     for upstream_mv_table_id in snapshot_backfill_info
                         .upstream_mv_table_id_to_backfill_epoch
@@ -680,6 +676,23 @@ impl DatabaseCheckpointControl {
                         .cloned()
                         .collect();
 
+                    // Keep upstream-aware no-shuffle mapping for split alignment only.
+                    let split_edges = self.database_info.build_edge(
+                        Some((&info, true)),
+                        None,
+                        None,
+                        partial_graph_manager.control_stream_manager(),
+                        &actors.stream_actors,
+                        &actors.actor_location,
+                    );
+                    // Phase 2: Resolve source-level DiscoveredSplits to actor-level SplitAssignment
+                    let resolved_split_assignment = resolve_source_splits(
+                        &info,
+                        &actors,
+                        split_edges.actor_new_no_shuffle(),
+                        &self.database_info,
+                    )?;
+
                     // Batch refresh runs in its own partial graph and does not connect to
                     // upstream actors with dispatcher edges.
                     let mut edges = self.database_info.build_edge_for_batch_refresh_rerun(
@@ -694,27 +707,31 @@ impl DatabaseCheckpointControl {
                     // Create a BatchRefreshJobCheckpointControl directly.
                     // It handles its own partial graph and barrier control.
                     assert!(
-                        !self
-                            .independent_checkpoint_job_controls
-                            .contains_key(&job_id),
+                        !self.creating_streaming_job_controls.contains_key(&job_id)
+                            && !self.batch_refresh_job_controls.contains_key(&job_id),
                         "duplicated creating batch refresh job {job_id}"
                     );
 
                     let snapshot_backfill_info_clone =
                         batch_refresh_info.snapshot_backfill_info.clone();
                     let refresh_interval_sec = batch_refresh_info.refresh_interval_sec;
-
-                    // Batch refresh jobs must not contain source/source-backfill nodes,
-                    // so resolved_split_assignment is always empty.
-                    let empty_split_assignment = Default::default();
+                    let upstream_table_ids: HashSet<TableId> = snapshot_backfill_info_clone
+                        .upstream_mv_table_id_to_backfill_epoch
+                        .keys()
+                        .cloned()
+                        .collect();
 
                     let job = BatchRefreshJobCheckpointControl::new(
                         CreateSnapshotBackfillJobCommandInfo {
                             info: info.clone(),
                             snapshot_backfill_info: snapshot_backfill_info_clone.clone(),
                             cross_db_snapshot_backfill_info,
-                            resolved_split_assignment: Default::default(),
+                            resolved_split_assignment: resolved_split_assignment.clone(),
                             refresh_interval_sec: Some(refresh_interval_sec),
+                        },
+                        BatchRefreshJobInfo {
+                            batch_refresh_seconds: refresh_interval_sec,
+                            upstream_table_ids,
                         },
                         take(notifiers),
                         snapshot_backfill_upstream_tables,
@@ -722,18 +739,16 @@ impl DatabaseCheckpointControl {
                         hummock_version_stats,
                         partial_graph_manager,
                         &mut edges,
+                        &resolved_split_assignment,
                         &actors,
+                        ensembles,
                     )?;
 
-                    if let Some(fragment_infos) = job.fragment_infos() {
-                        self.database_info.shared_actor_infos.upsert(
-                            self.database_id,
-                            fragment_infos.values().map(|f| (f, job_id)),
-                        );
-                    }
+                    self.database_info
+                        .shared_actor_infos
+                        .upsert(self.database_id, job.fragment_infos_with_job_id());
 
-                    self.independent_checkpoint_job_controls
-                        .insert(job_id, IndependentCheckpointJobControl::BatchRefresh(job));
+                    self.batch_refresh_job_controls.insert(job_id, job);
 
                     // Register permanent subscriber (never unregistered until MV is dropped)
                     for upstream_mv_table_id in snapshot_backfill_info_clone
@@ -754,7 +769,7 @@ impl DatabaseCheckpointControl {
                         &mut edges,
                         partial_graph_manager.control_stream_manager(),
                         None,
-                        &empty_split_assignment,
+                        &resolved_split_assignment,
                         &actors.stream_actors,
                         &actors.actor_location,
                     )?;
@@ -1421,11 +1436,15 @@ impl DatabaseCheckpointControl {
             None => {
                 let mut finished_snapshot_backfill_job_info = HashMap::new();
                 if barrier_info.kind.is_checkpoint() {
-                    for (&job_id, job) in &mut self.independent_checkpoint_job_controls {
-                        if let IndependentCheckpointJobControl::CreatingStreamingJob(creating_job) =
-                            job
-                            && creating_job.should_merge_to_upstream()
-                        {
+                    let batch_refresh_ids: HashSet<JobId> =
+                        self.batch_refresh_job_controls.keys().copied().collect();
+                    for (&job_id, creating_job) in &mut self.creating_streaming_job_controls {
+                        // Batch refresh jobs must not merge to upstream. They cycle
+                        // idle → running → idle independently.
+                        if batch_refresh_ids.contains(&job_id) {
+                            continue;
+                        }
+                        if creating_job.should_merge_to_upstream() {
                             let info = creating_job
                                 .start_consume_upstream(partial_graph_manager, &barrier_info)?;
                             finished_snapshot_backfill_job_info
@@ -1652,47 +1671,45 @@ impl DatabaseCheckpointControl {
             }
         };
 
-        // Forward barrier to independent job controls
-        for (job_id, job) in &mut self.independent_checkpoint_job_controls {
-            match job {
-                IndependentCheckpointJobControl::CreatingStreamingJob(creating_job) => {
-                    if !finished_snapshot_backfill_jobs.contains(job_id) {
-                        let throttle_mutation = if let Some((ref jobs, ref config)) =
-                            throttle_for_creating_jobs
-                            && jobs.contains(job_id)
-                        {
-                            assert_eq!(
-                                jobs.len(),
-                                1,
-                                "should not alter rate limit of snapshot backfill job with other jobs"
-                            );
-                            Some((
-                                Mutation::Throttle(ThrottleMutation {
-                                    fragment_throttle: config
-                                        .iter()
-                                        .map(|(fragment_id, config)| (*fragment_id, *config))
-                                        .collect(),
-                                }),
-                                take(notifiers),
-                            ))
-                        } else {
-                            None
-                        };
-                        creating_job.on_new_upstream_barrier(
-                            partial_graph_manager,
-                            &barrier_info,
-                            throttle_mutation,
-                        )?;
-                    }
-                }
-                IndependentCheckpointJobControl::BatchRefresh(batch_refresh_job) => {
-                    batch_refresh_job.on_new_upstream_barrier(
-                        partial_graph_manager,
-                        &barrier_info,
-                        None, // no throttle mutation for batch refresh jobs
-                    )?;
-                }
+        // Forward barrier to creating streaming job controls
+        for (job_id, creating_job) in &mut self.creating_streaming_job_controls {
+            if !finished_snapshot_backfill_jobs.contains(job_id) {
+                let throttle_mutation = if let Some((ref jobs, ref config)) =
+                    throttle_for_creating_jobs
+                    && jobs.contains(job_id)
+                {
+                    assert_eq!(
+                        jobs.len(),
+                        1,
+                        "should not alter rate limit of snapshot backfill job with other jobs"
+                    );
+                    Some((
+                        Mutation::Throttle(ThrottleMutation {
+                            fragment_throttle: config
+                                .iter()
+                                .map(|(fragment_id, config)| (*fragment_id, *config))
+                                .collect(),
+                        }),
+                        take(notifiers),
+                    ))
+                } else {
+                    None
+                };
+                creating_job.on_new_upstream_barrier(
+                    partial_graph_manager,
+                    &barrier_info,
+                    throttle_mutation,
+                )?;
             }
+        }
+
+        // Forward barrier to batch refresh job controls
+        for batch_refresh_job in self.batch_refresh_job_controls.values_mut() {
+            batch_refresh_job.on_new_upstream_barrier(
+                partial_graph_manager,
+                &barrier_info,
+                None, // no throttle mutation for batch refresh jobs
+            )?;
         }
 
         partial_graph_manager.inject_barrier(

@@ -262,20 +262,25 @@ impl DatabaseStatusAction<'_, EnterReset> {
         match database_status {
             DatabaseCheckpointControlStatus::Running(database) => {
                 let mut resetting_partial_graphs = HashSet::new();
-                let new_reset_partial_graphs: HashSet<_> = database
-                    .independent_checkpoint_job_controls
-                    .drain()
-                    .filter_map(|(job_id, job)| {
-                        let partial_graph_id = to_partial_graph_id(self.database_id, Some(job_id));
-                        if job.reset() {
-                            resetting_partial_graphs.insert(partial_graph_id);
-                            None
-                        } else {
-                            Some(partial_graph_id)
-                        }
-                    })
-                    .chain([to_partial_graph_id(self.database_id, None)])
-                    .collect();
+                // Drain both job-control maps and reset each job's partial graph.
+                let mut new_reset_partial_graphs: HashSet<_> = HashSet::new();
+                for (job_id, job) in database.creating_streaming_job_controls.drain() {
+                    let partial_graph_id = to_partial_graph_id(self.database_id, Some(job_id));
+                    if job.reset() {
+                        resetting_partial_graphs.insert(partial_graph_id);
+                    } else {
+                        new_reset_partial_graphs.insert(partial_graph_id);
+                    }
+                }
+                for (job_id, job) in database.batch_refresh_job_controls.drain() {
+                    let partial_graph_id = to_partial_graph_id(self.database_id, Some(job_id));
+                    if job.reset() {
+                        resetting_partial_graphs.insert(partial_graph_id);
+                    } else {
+                        new_reset_partial_graphs.insert(partial_graph_id);
+                    }
+                }
+                new_reset_partial_graphs.insert(to_partial_graph_id(self.database_id, None));
                 resetting_partial_graphs
                     .iter()
                     .for_each(|partial_graph_id| {

@@ -23,7 +23,9 @@ use risingwave_pb::stream_plan::barrier::PbBarrierKind;
 pub(crate) mod batch_refresh_job;
 pub(crate) mod creating_job;
 
-pub(crate) use batch_refresh_job::{BatchRefreshJobCheckpointControl, BatchRefreshJobInfo};
+pub(crate) use batch_refresh_job::{
+    BatchRefreshJobCachedContext, BatchRefreshJobCheckpointControl, BatchRefreshJobInfo,
+};
 pub(crate) use creating_job::CreatingStreamingJobControl;
 
 use crate::barrier::info::BarrierInfo;
@@ -78,7 +80,7 @@ impl IndependentCheckpointJobControl {
     pub(crate) fn gen_backfill_progress(&self) -> Option<BackfillProgress> {
         match self {
             Self::CreatingStreamingJob(j) => Some(j.gen_backfill_progress()),
-            Self::BatchRefresh(j) => j.gen_backfill_progress(),
+            Self::BatchRefresh(j) => Some(j.gen_backfill_progress()),
         }
     }
 
@@ -99,7 +101,10 @@ impl IndependentCheckpointJobControl {
     pub(crate) fn collect(&mut self, collected_barrier: CollectedBarrier<'_>) -> bool {
         match self {
             Self::CreatingStreamingJob(j) => j.collect(collected_barrier),
-            Self::BatchRefresh(j) => j.collect(collected_barrier),
+            Self::BatchRefresh(j) => {
+                j.collect(collected_barrier);
+                false
+            }
         }
     }
 
@@ -138,7 +143,9 @@ impl IndependentCheckpointJobControl {
     pub(crate) fn on_partial_graph_reset(self) {
         match self {
             Self::CreatingStreamingJob(j) => j.on_partial_graph_reset(),
-            Self::BatchRefresh(mut j) => j.on_partial_graph_reset(),
+            Self::BatchRefresh(mut j) => {
+                j.on_partial_graph_reset();
+            }
         }
     }
 

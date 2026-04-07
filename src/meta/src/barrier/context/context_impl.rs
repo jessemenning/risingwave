@@ -30,8 +30,11 @@ use risingwave_pb::stream_service::streaming_control_stream_request::PbInitReque
 use risingwave_rpc_client::StreamingControlHandle;
 
 use crate::barrier::cdc_progress::CdcTableBackfillTracker;
+use crate::barrier::checkpoint::BatchRefreshJobCachedContext;
 use crate::barrier::command::{PostCollectCommand, ResumeBackfillTarget};
-use crate::barrier::context::{GlobalBarrierWorkerContext, GlobalBarrierWorkerContextImpl};
+use crate::barrier::context::{
+    BatchRefreshResolvedEpochs, GlobalBarrierWorkerContext, GlobalBarrierWorkerContextImpl,
+};
 use crate::barrier::progress::TrackingJob;
 use crate::barrier::schedule::MarkReadyOptions;
 use crate::barrier::{
@@ -242,6 +245,158 @@ impl GlobalBarrierWorkerContext for GlobalBarrierWorkerContextImpl {
         }
 
         Ok(())
+    }
+
+    async fn resolve_batch_refresh_upstream_log_epochs(
+        &self,
+        upstream_table_ids: HashSet<TableId>,
+        last_committed_epoch: u64,
+    ) -> MetaResult<BatchRefreshResolvedEpochs> {
+        self.hummock_manager
+            .on_current_version(|version| {
+                let mut target_epoch = last_committed_epoch;
+                let mut log_epochs = HashMap::new();
+                for upstream_table_id in &upstream_table_ids {
+                    let upstream_committed_epoch = version
+                        .state_table_info
+                        .info()
+                        .get(upstream_table_id)
+                        .map(|info| info.committed_epoch)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "cannot get committed epoch for upstream table {}",
+                                upstream_table_id
+                            )
+                        })?;
+                    target_epoch = std::cmp::max(target_epoch, upstream_committed_epoch);
+                    if upstream_committed_epoch > last_committed_epoch
+                        && let Some(table_change_log) =
+                            version.table_change_log.get(upstream_table_id)
+                    {
+                        let epochs = table_change_log
+                            .filter_epoch((last_committed_epoch, upstream_committed_epoch))
+                            .map(|epoch_log| {
+                                (
+                                    epoch_log.non_checkpoint_epochs.clone(),
+                                    epoch_log.checkpoint_epoch,
+                                )
+                            })
+                            .collect();
+                        log_epochs.insert(*upstream_table_id, epochs);
+                    }
+                }
+                Ok((log_epochs, target_epoch))
+            })
+            .await
+    }
+
+    async fn load_batch_refresh_cached_context(
+        &self,
+        job_id: JobId,
+        database_id: DatabaseId,
+    ) -> MetaResult<BatchRefreshJobCachedContext> {
+        use crate::barrier::checkpoint::resolve_no_shuffle_ensembles;
+        use crate::model::StreamJobFragmentsToCreate;
+        use crate::stream::{StreamFragmentGraph, UserDefinedFragmentBackfillOrder};
+
+        // Load fragment definitions from the metadata store.
+        let (stream_job_fragments, _stream_actors, _actor_status) = self
+            .metadata_manager
+            .catalog_controller
+            .get_job_fragments_by_id(job_id)
+            .await?;
+
+        // Load the streaming job model and extra info in one read guard scope.
+        let (streaming_job_model, extra_info) = {
+            let inner = self
+                .metadata_manager
+                .catalog_controller
+                .get_inner_read_guard()
+                .await;
+            let model = {
+                use sea_orm::EntityTrait;
+                risingwave_meta_model::streaming_job::Entity::find_by_id(job_id)
+                    .one(&inner.db)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("streaming job {} not found", job_id))?
+            };
+            let extra =
+                crate::controller::utils::get_streaming_job_extra_info(&inner.db, vec![job_id])
+                    .await?;
+            (model, extra)
+        };
+        let definition = extra_info
+            .get(&job_id)
+            .map(|info| info.job_definition.clone())
+            .unwrap_or_default();
+
+        // Load database resource group.
+        let database_resource_group = self
+            .metadata_manager
+            .get_database_resource_group(database_id)
+            .await?;
+
+        // Load downstream relations for this job's fragments.
+        let fragment_ids: Vec<_> = stream_job_fragments.fragments.keys().copied().collect();
+        let downstreams = self
+            .metadata_manager
+            .catalog_controller
+            .get_fragment_downstream_relations(fragment_ids)
+            .await?;
+        let stream_job_fragments_to_create = StreamJobFragmentsToCreate {
+            inner: stream_job_fragments,
+            downstreams,
+        };
+
+        // Resolve NoShuffle ensembles (no upstream for batch refresh reruns).
+        let ensembles = resolve_no_shuffle_ensembles(
+            &stream_job_fragments_to_create,
+            &Default::default(), // no upstream_fragment_downstreams for batch refresh
+        )?;
+
+        // Load backfill ordering from job extra info.
+        let fragment_backfill_ordering = extra_info
+            .get(&job_id)
+            .and_then(|info| info.backfill_orders.as_ref())
+            .map(|orders| {
+                let user_defined = UserDefinedFragmentBackfillOrder::new(orders.0.clone());
+                StreamFragmentGraph::extend_fragment_backfill_ordering_with_locality_backfill(
+                    user_defined,
+                    &stream_job_fragments_to_create.downstreams,
+                    || {
+                        stream_job_fragments_to_create.inner.fragments.iter().map(
+                            |(fragment_id, fragment)| {
+                                (*fragment_id, fragment.fragment_type_mask, &fragment.nodes)
+                            },
+                        )
+                    },
+                )
+            })
+            .unwrap_or_default();
+
+        // Build locality mapping.
+        let locality_fragment_state_table_mapping = stream_job_fragments_to_create
+            .inner
+            .fragments
+            .iter()
+            .map(|(frag_id, fragment)| {
+                (
+                    *frag_id,
+                    std::iter::once((*frag_id, fragment.state_table_ids.iter().cloned().collect()))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        Ok(BatchRefreshJobCachedContext {
+            stream_job_fragments: stream_job_fragments_to_create,
+            streaming_job_model,
+            definition,
+            database_resource_group,
+            ensembles,
+            fragment_backfill_ordering,
+            locality_fragment_state_table_mapping,
+        })
     }
 }
 

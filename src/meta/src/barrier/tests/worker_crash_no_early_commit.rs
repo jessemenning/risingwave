@@ -160,6 +160,22 @@ impl GlobalBarrierWorkerContext for MockBarrierWorkerContext {
     ) -> MetaResult<()> {
         unimplemented!()
     }
+
+    async fn resolve_batch_refresh_upstream_log_epochs(
+        &self,
+        _upstream_table_ids: HashSet<TableId>,
+        _last_committed_epoch: u64,
+    ) -> MetaResult<(HashMap<TableId, Vec<(Vec<u64>, u64)>>, u64)> {
+        unreachable!()
+    }
+
+    async fn load_batch_refresh_cached_context(
+        &self,
+        _job_id: JobId,
+        _database_id: DatabaseId,
+    ) -> MetaResult<crate::barrier::checkpoint::BatchRefreshJobCachedContext> {
+        unreachable!()
+    }
 }
 
 #[tokio::test]

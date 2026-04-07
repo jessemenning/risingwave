@@ -21,6 +21,7 @@ use std::mem::take;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::time::Duration;
 
+pub(crate) use barrier_control::CreatingStreamingJobBarrierStats;
 use risingwave_common::catalog::{DatabaseId, TableId};
 use risingwave_common::id::JobId;
 use risingwave_common::metrics::LabelGuardedIntGauge;
@@ -37,10 +38,8 @@ use status::CreatingStreamingJobStatus;
 use tracing::{debug, info};
 
 use super::super::state::RenderResult;
-use super::IndependentCheckpointJobControl;
 use crate::MetaResult;
 use crate::barrier::backfill_order_control::get_nodes_with_backfill_dependencies;
-use crate::barrier::checkpoint::independent_job::creating_job::barrier_control::CreatingStreamingJobBarrierStats;
 use crate::barrier::checkpoint::independent_job::creating_job::status::CreateMviewLogStoreProgressTracker;
 use crate::barrier::command::PostCollectCommand;
 use crate::barrier::context::CreateSnapshotBackfillJobCommandInfo;
@@ -89,7 +88,7 @@ pub(crate) struct CreatingStreamingJobControl {
 
 impl CreatingStreamingJobControl {
     pub(crate) fn new<'a>(
-        entry: hash_map::VacantEntry<'a, JobId, IndependentCheckpointJobControl>,
+        entry: hash_map::VacantEntry<'a, JobId, CreatingStreamingJobControl>,
         create_info: CreateSnapshotBackfillJobCommandInfo,
         notifiers: Vec<Notifier>,
         snapshot_backfill_upstream_tables: HashSet<TableId>,
@@ -185,23 +184,19 @@ impl CreatingStreamingJobControl {
 
         let partial_graph_id = to_partial_graph_id(database_id, Some(job_id));
 
-        let IndependentCheckpointJobControl::CreatingStreamingJob(job) = entry.insert(
-            IndependentCheckpointJobControl::CreatingStreamingJob(Self {
-                partial_graph_id,
-                job_id,
-                snapshot_backfill_upstream_tables,
-                max_committed_epoch: None,
-                snapshot_epoch,
-                status: CreatingStreamingJobStatus::PlaceHolder, // filled in later code
-                upstream_lag: GLOBAL_META_METRICS
-                    .snapshot_backfill_lag
-                    .with_guarded_label_values(&[&format!("{}", job_id)]),
-                node_actors,
-                state_table_ids,
-            }),
-        ) else {
-            unreachable!()
-        };
+        let job = entry.insert(Self {
+            partial_graph_id,
+            job_id,
+            snapshot_backfill_upstream_tables,
+            max_committed_epoch: None,
+            snapshot_epoch,
+            status: CreatingStreamingJobStatus::PlaceHolder, // filled in later code
+            upstream_lag: GLOBAL_META_METRICS
+                .snapshot_backfill_lag
+                .with_guarded_label_values(&[&format!("{}", job_id)]),
+            node_actors,
+            state_table_ids,
+        });
 
         let mut graph_adder = partial_graph_manager.add_partial_graph(
             partial_graph_id,
@@ -252,7 +247,7 @@ impl CreatingStreamingJobControl {
         }
     }
 
-    pub(super) fn gen_fragment_backfill_progress(&self) -> Vec<FragmentBackfillProgress> {
+    pub(crate) fn gen_fragment_backfill_progress(&self) -> Vec<FragmentBackfillProgress> {
         match &self.status {
             CreatingStreamingJobStatus::ConsumingSnapshot {
                 create_mview_tracker,
@@ -573,7 +568,7 @@ impl CreatingStreamingJobControl {
         }
     }
 
-    pub(super) fn pinned_upstream_log_epoch(&self) -> (u64, HashSet<TableId>) {
+    pub(crate) fn pinned_upstream_log_epoch(&self) -> (u64, HashSet<TableId>) {
         (
             max(self.max_committed_epoch.unwrap_or(0), self.snapshot_epoch),
             self.snapshot_backfill_upstream_tables.clone(),
@@ -793,7 +788,7 @@ impl CreatingStreamingJobControl {
             })
     }
 
-    pub(super) fn ack_completed(
+    pub(crate) fn ack_completed(
         &mut self,
         partial_graph_manager: &mut PartialGraphManager,
         completed_epoch: u64,
@@ -823,6 +818,14 @@ impl CreatingStreamingJobControl {
         self.status.fragment_infos()
     }
 
+    pub fn fragment_infos_with_job_id(
+        &self,
+    ) -> impl Iterator<Item = (&InflightFragmentInfo, JobId)> + '_ {
+        self.fragment_infos()
+            .into_iter()
+            .flat_map(|fragments| fragments.values().map(|fragment| (fragment, self.job_id)))
+    }
+
     pub fn into_tracking_job(self) -> TrackingJob {
         match self.status {
             CreatingStreamingJobStatus::ConsumingSnapshot { .. }
@@ -835,7 +838,7 @@ impl CreatingStreamingJobControl {
         }
     }
 
-    pub(super) fn on_partial_graph_reset(mut self) {
+    pub(crate) fn on_partial_graph_reset(mut self) {
         match &mut self.status {
             CreatingStreamingJobStatus::Resetting(notifiers) => {
                 for notifier in notifiers.drain(..) {
@@ -859,7 +862,7 @@ impl CreatingStreamingJobControl {
     /// Drop a creating snapshot backfill job by directly resetting the partial graph
     /// Return `false` if the partial graph has been merged to upstream database, and `true` otherwise
     /// to mean that the job has been dropped.
-    pub(super) fn drop(
+    pub(crate) fn drop(
         &mut self,
         notifiers: &mut Vec<Notifier>,
         partial_graph_manager: &mut PartialGraphManager,
