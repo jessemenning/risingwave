@@ -218,3 +218,73 @@ SELECT id, name, description, new_col from rw_test_include_ts order by id;
 
 statement ok
 drop source pg_source_ts cascade;
+
+# Test composite type with auto schema change
+system ok
+psql -c "
+    DROP TABLE IF EXISTS composite_auto_change_inline;
+    DROP TYPE IF EXISTS composite_money_inline;
+    CREATE TYPE composite_money_inline AS (
+        currency varchar,
+        amount decimal
+    );
+    CREATE TABLE composite_auto_change_inline(
+        id int PRIMARY KEY,
+        total composite_money_inline
+    );
+    INSERT INTO composite_auto_change_inline VALUES
+        (1, ROW('USD', 1.23)::composite_money_inline);
+    "
+
+statement ok
+create source pg_source_composite_auto WITH (
+ connector = 'postgres-cdc',
+ hostname = '${PGHOST:localhost}',
+ port = '${PGPORT:5432}',
+ username = '${PGUSER:$USER}',
+ password = '${PGPASSWORD:}',
+ database.name = '${PGDATABASE:postgres}',
+ slot.name = 'pg_slot_composite_auto',
+ debezium.include.unknown.datatypes = 'true',
+ auto.schema.change = 'true'
+);
+
+statement ok
+create table rw_composite_auto_change (*) from pg_source_composite_auto table 'public.composite_auto_change_inline';
+
+query IT retry 6 backoff 1s
+SELECT id, total from rw_composite_auto_change order by id;
+----
+1 (USD,1.23)
+
+system ok
+psql -c "
+    ALTER TABLE composite_auto_change_inline ADD COLUMN discount composite_money_inline;
+    UPDATE composite_auto_change_inline
+    SET discount = ROW('USD', 0.11)::composite_money_inline
+    WHERE id = 1;
+    INSERT INTO composite_auto_change_inline VALUES
+      (2, ROW('EUR', 2.34)::composite_money_inline, ROW('EUR', 0.22)::composite_money_inline);
+    SELECT pg_switch_wal();
+    CHECKPOINT;
+"
+
+query TTTT retry 12 backoff 1s
+describe rw_composite_auto_change;
+----
+id integer false NULL
+total character varying false NULL
+discount character varying false NULL
+_rw_timestamp timestamp with time zone true NULL
+primary key id NULL NULL
+distribution key id NULL NULL
+table description rw_composite_auto_change NULL NULL
+
+query ITT retry 12 backoff 1s
+SELECT id, total, discount from rw_composite_auto_change order by id;
+----
+1 (USD,1.23) (USD,0.11)
+2 (EUR,2.34) (EUR,0.22)
+
+statement ok
+drop source pg_source_composite_auto cascade;
