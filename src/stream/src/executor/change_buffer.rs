@@ -33,53 +33,38 @@ use crate::common::log_store_impl::kv_log_store::state::{
 use crate::executor::prelude::*;
 use crate::task::FragmentId;
 
-#[derive(Default)]
-struct EpochChunkBuffer {
-    chunks: VecDeque<StreamChunk>,
-    row_count: usize,
-}
-
-impl EpochChunkBuffer {
-    fn push_chunk(&mut self, chunk: StreamChunk) {
-        self.row_count += chunk.cardinality();
-        self.chunks.push_back(chunk);
-    }
-
-    fn exceeds(&self, max_rows: usize) -> bool {
-        self.row_count >= max_rows
-    }
-
-    fn drain(&mut self) -> impl Iterator<Item = StreamChunk> + '_ {
-        self.row_count = 0;
-        self.chunks.drain(..)
-    }
-
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
-    }
-}
-
-/// Buffers incoming chunks within an epoch and spills to local hummock when the buffer exceeds the
-/// threshold.
-///
-/// This first version intentionally focuses on the outer control flow:
-/// - buffer incoming chunks in a `VecDeque`
-/// - spill the buffered chunks to local hummock when the threshold is exceeded
-/// - on barrier, drain persisted data first, then drain the in-memory buffer
-///
-/// The actual row encoding into local hummock and the uncommitted changelog reader are left as
-/// follow-up work. Once spill happens, the executor will return a clear error instead of silently
-/// dropping data.
 pub struct ChangeBufferExecutor<S: StateStore> {
+    // Todo(ying): add metrics
     actor_context: ActorContextRef,
     input: Executor,
     state_store: S,
     table_id: TableId,
-    serde: LogStoreRowSerde,
-    vnodes: Arc<Bitmap>,
-    buffer_max_rows: usize,
-    chunk_size: usize,
+    buffer_max_size: usize,
+}
+
+struct ChangeBuffer {
+    buffer: VecDeque<StreamChunk>,
+    current_size: usize,
+    max_size: usize,
+}
+
+impl ChangeBuffer {
+    fn add_or_flush_chunk(
+        &mut self,
+        chunk: StreamChunk,
+    ) -> Option<StreamChunk> {
+        let current_size = self.current_size;
+        let chunk_size = chunk.cardinality();
+
+        let should_flush_chunk = current_size + chunk_size > self.max_size;
+        
+        if should_flush_chunk {
+            Some(chunk)
+        } else {
+            self.buffer.push_back(chunk);
+            None
+        }
+    }
 }
 
 impl<S: StateStore> ChangeBufferExecutor<S> {
@@ -89,78 +74,15 @@ impl<S: StateStore> ChangeBufferExecutor<S> {
         input: Executor,
         state_store: S,
         table_id: TableId,
-        serde: LogStoreRowSerde,
-        vnodes: Arc<Bitmap>,
-        buffer_max_rows: usize,
-        chunk_size: usize,
+        buffer_max_size: usize,
     ) -> Self {
         Self {
             actor_context,
             input,
             state_store,
             table_id,
-            serde,
-            vnodes,
-            buffer_max_rows,
-            chunk_size,
+            buffer_max_size,
         }
-    }
-
-    async fn init_local_store(
-        state_store: &S,
-        table_id: TableId,
-        fragment_id: FragmentId,
-        serde: LogStoreRowSerde,
-        vnodes: Arc<Bitmap>,
-        epoch: EpochPair,
-        chunk_size: usize,
-    ) -> StreamExecutorResult<(
-        LogStoreReadState<<S::Local as LocalStateStore>::FlushedSnapshotReader>,
-        LogStoreWriteState<S::Local>,
-    )> {
-        let mut local_store = state_store
-            .new_local(NewLocalOptions {
-                table_id,
-                fragment_id,
-                op_consistency_level: OpConsistencyLevel::ConsistentOldValue {
-                    check_old_value: CHECK_BYTES_EQUAL.clone(),
-                    is_log_store: true,
-                },
-                table_option: TableOption {
-                    retention_seconds: None,
-                },
-                is_replicated: false,
-                vnodes,
-                upload_on_flush: false,
-            })
-            .await;
-        local_store.init(InitOptions::new(epoch)).await?;
-        Ok(new_log_store_state(
-            table_id,
-            local_store,
-            serde,
-            chunk_size,
-        ))
-    }
-
-    async fn spill_buffer_to_local_hummock(
-        write_state: &mut LogStoreWriteState<S::Local>,
-        buffer: &mut EpochChunkBuffer,
-        epoch: u64,
-    ) -> StreamExecutorResult<()> {
-        let _ = (write_state, buffer, epoch);
-        Err(anyhow!("ChangeBufferExecutor spill-to-hummock is not implemented yet").into())
-    }
-
-    async fn emit_persisted_epoch_changes(
-        read_state: &mut LogStoreReadState<<S::Local as LocalStateStore>::FlushedSnapshotReader>,
-        epoch: u64,
-    ) -> StreamExecutorResult<Vec<StreamChunk>> {
-        let _ = (read_state, epoch);
-        Err(
-            anyhow!("ChangeBufferExecutor uncommitted changelog iterator is not implemented yet")
-                .into(),
-        )
     }
 
     #[try_stream(ok = Message, error = StreamExecutorError)]
@@ -170,44 +92,50 @@ impl<S: StateStore> ChangeBufferExecutor<S> {
             input,
             state_store,
             table_id,
-            serde,
-            vnodes,
-            buffer_max_rows,
-            chunk_size,
+            buffer_max_size,
         } = self;
 
         let mut input = input.execute();
 
         let first_barrier = expect_first_barrier(&mut input).await?;
-        let (mut read_state, mut write_state) = Self::init_local_store(
-            &state_store,
-            table_id,
-            actor_context.fragment_id,
-            serde,
-            vnodes.clone(),
-            first_barrier.epoch,
-            chunk_size,
-        )
-        .await?;
-        let mut current_epoch = first_barrier.epoch.curr;
-        let mut buffer = EpochChunkBuffer::default();
-        let mut has_spilled = false;
+        let first_write_epoch = first_barrier.epoch;
+        yield Message::Barrier(first_barrier.clone());
 
-        yield Message::Barrier(first_barrier);
+        let local_state_store = self
+        .state_store
+        .new_local(NewLocalOptions { 
+                table_id: self.table_id,
+                fragment_id: self.actor_context.fragment_id,
+                op_consistency_level: OpConsistencyLevel::Inconsistent,
+                table_option: TableOption {
+                    retention_seconds: None,
+                },
+                is_replicated: false,
+                vnodes: self.serde.vnodes().clone(),
+                upload_on_flush: false,
+            })
+        .await;
+
+        let buffer = ChangeBuffer {
+            buffer: VecDeque::new(),
+            current_size: 0,
+            max_size: buffer_max_size,
+        };
+        let curr_epoch = first_write_epoch.curr;
 
         #[for_await]
         for msg in input {
             match msg? {
                 Message::Chunk(chunk) => {
-                    buffer.push_chunk(chunk);
-                    if buffer.exceeds(buffer_max_rows) {
-                        Self::spill_buffer_to_local_hummock(
-                            &mut write_state,
-                            &mut buffer,
-                            current_epoch,
-                        )
-                        .await?;
-                        has_spilled = true;
+                    if chunk.cardinality() == 0 {
+                        tracing::warn!(
+                            epoch = curr_epoch,
+                            "received empty chunk (cardinality=0), skipping"
+                        );
+                    } else {
+                        if let Some(chunk) = buffer.add_or_flush_chunk(chunk) {
+                            local_state_store.insert()
+                        }
                     }
                 }
                 Message::Barrier(barrier) => {
