@@ -413,6 +413,16 @@ pub trait LocalStateStore: StateStoreGet + StateStoreWriteEpochControl + StaticS
     fn update_vnode_bitmap(&mut self, vnodes: Arc<Bitmap>) -> impl StorageFuture<'_, Arc<Bitmap>>;
 }
 
+/// Reads the uncommitted net changelog from a local state store instance.
+///
+/// Unlike [`StateStoreReadLog`], this trait is intended for executor-private local state and does
+/// not expose committed-epoch or key-range semantics.
+pub trait LocalStateStoreReadLog: LocalStateStore {
+    type ChangeLogIter: StateStoreReadChangeLogIter;
+
+    fn iter_uncommitted_log(&self) -> impl StorageFuture<'_, Self::ChangeLogIter>;
+}
+
 pub trait StateStoreWriteEpochControl: StaticSendSync {
     fn flush(&mut self) -> impl StorageFuture<'_, usize>;
 
