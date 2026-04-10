@@ -24,9 +24,11 @@ use risingwave_common::array::Op;
 use risingwave_common::array::stream_chunk::StreamChunkMut;
 use risingwave_common::bitmap::Bitmap;
 use risingwave_common::catalog::{ColumnCatalog, Field};
+use risingwave_common::hash::table_distribution::SINGLETON_VNODE;
 use risingwave_common::metrics::{GLOBAL_ERROR_METRICS, LabelGuardedIntGauge};
 use risingwave_common::row::OwnedRow;
 use risingwave_common::types::ScalarImpl;
+use risingwave_common::util::value_encoding::column_aware_row_encoding::ColumnAwareSerde;
 use risingwave_common_estimate_size::EstimateSize;
 use risingwave_common_estimate_size::collections::EstimatedVec;
 use risingwave_common_rate_limit::RateLimit;
@@ -34,7 +36,8 @@ use risingwave_connector::dispatch_sink;
 use risingwave_connector::sink::catalog::{SinkId, SinkType};
 use risingwave_connector::sink::log_store::{
     FlushCurrentEpochOptions, FlushCurrentEpochResult, LogReader, LogReaderExt, LogReaderMetrics,
-    LogStoreFactory, LogWriter, LogWriterExt, LogWriterMetrics, ReportedSinkErrorRows,
+    LogStoreFactory, LogWriter, LogWriterExt, LogWriterMetrics, ReportedSinkErrorRow,
+    ReportedSinkErrorRows,
 };
 use risingwave_connector::sink::{
     GLOBAL_SINK_METRICS, LogSinker, SINK_SKIP_ERROR_OPTION, SINK_USER_FORCE_COMPACTION, Sink,
@@ -52,8 +55,11 @@ use crate::common::change_buffer::{OutputKind, output_kind};
 use crate::common::compact_chunk::{
     InconsistencyBehavior, StreamChunkCompactor, compact_chunk_inline,
 };
-use crate::common::table::state_table::StateTable;
+use crate::common::table::state_table::StateTableInner;
 use crate::executor::prelude::*;
+
+type ErrorStateTable<S> = StateTableInner<S, ColumnAwareSerde>;
+
 pub struct SinkExecutor<F: LogStoreFactory, S: StateStore> {
     actor_context: ActorContextRef,
     info: ExecutorInfo,
@@ -62,8 +68,7 @@ pub struct SinkExecutor<F: LogStoreFactory, S: StateStore> {
     input_columns: Vec<ColumnCatalog>,
     sink_param: SinkParam,
     log_store_factory: F,
-    error_table: Option<StateTable<S>>,
-    skip_error: bool,
+    error_table: Option<ErrorStateTable<S>>,
     sink_writer_param: SinkWriterParam,
     chunk_size: usize,
     input_data_types: Vec<DataType>,
@@ -72,55 +77,57 @@ pub struct SinkExecutor<F: LogStoreFactory, S: StateStore> {
 }
 
 struct PendingErrorRows {
-    rows_by_epoch: HashMap<u64, Vec<OwnedRow>>,
-    next_row_id_by_epoch: HashMap<u64, i32>,
+    rows_by_epoch: Vec<(u64, Vec<ReportedSinkErrorRow>)>,
 }
 
 impl PendingErrorRows {
-    fn add_reported_rows(&mut self, reported: ReportedSinkErrorRows, vnode: i16) {
-        let next_row_id = self.next_row_id_by_epoch.entry(reported.epoch).or_insert(0);
-        let rows = self.rows_by_epoch.entry(reported.epoch).or_default();
-        for reported_row in reported.rows {
-            let mut values = Vec::with_capacity(reported_row.row.as_inner().len() + 5);
-            values.push(Some(ScalarImpl::Int64(reported.epoch as i64)));
-            values.push(Some(ScalarImpl::Int32(*next_row_id)));
-            values.push(Some(ScalarImpl::Int16(vnode)));
-            values.push(Some(ScalarImpl::Int16(reported_row.op.to_i16())));
-            values.push(reported_row.extra_info.map(ScalarImpl::Jsonb));
-            values.extend(reported_row.row.into_inner().into_vec());
-            rows.push(OwnedRow::new(values));
-            *next_row_id += 1;
+    fn add_reported_rows(&mut self, reported: ReportedSinkErrorRows) {
+        if self
+            .rows_by_epoch
+            .last()
+            .is_none_or(|(epoch, _)| *epoch != reported.epoch)
+        {
+            if let Some((epoch, _)) = self.rows_by_epoch.last() {
+                assert!(
+                    *epoch < reported.epoch,
+                    "reported sink error rows should be ordered by epoch"
+                );
+            }
+            self.rows_by_epoch.push((reported.epoch, vec![]));
         }
+        let (_, rows) = self
+            .rows_by_epoch
+            .last_mut()
+            .expect("rows_by_epoch should have current reported epoch");
+        rows.extend(reported.rows);
     }
 
-    fn drain_ready_rows(&mut self, epoch: u64) -> Vec<OwnedRow> {
-        let committed_epochs = self
-            .rows_by_epoch
-            .keys()
-            .copied()
-            .filter(|reported_epoch| *reported_epoch <= epoch)
-            .collect_vec();
+    fn drain_ready_rows(&mut self, epoch: u64) -> Vec<(u64, ReportedSinkErrorRow)> {
         let mut rows = vec![];
-        for committed_epoch in committed_epochs {
-            self.next_row_id_by_epoch.remove(&committed_epoch);
-            if let Some(epoch_rows) = self.rows_by_epoch.remove(&committed_epoch) {
-                rows.extend(epoch_rows);
-            }
+        let ready_epoch_count = self
+            .rows_by_epoch
+            .iter()
+            .take_while(|(reported_epoch, _)| *reported_epoch <= epoch)
+            .count();
+        for (reported_epoch, epoch_rows) in self.rows_by_epoch.drain(..ready_epoch_count) {
+            rows.extend(
+                epoch_rows
+                    .into_iter()
+                    .map(|reported_row| (reported_epoch, reported_row)),
+            );
         }
         rows
     }
 }
 
-fn select_error_vnode(error_table: Option<&StateTable<impl StateStore>>, actor_id: ActorId) -> i16 {
-    let Some(vnodes) = error_table.map(StateTable::vnodes) else {
-        return 0;
+fn select_error_vnode(vnodes: Option<&Bitmap>) -> i16 {
+    let Some(vnodes) = vnodes else {
+        return SINGLETON_VNODE.to_index() as i16;
     };
-    let vnode_count = vnodes.count_ones();
-    if vnode_count == 0 {
-        return 0;
-    }
-    let vnode_idx = actor_id.as_raw_id() as usize % vnode_count;
-    vnodes.iter_ones().nth(vnode_idx).unwrap_or(0) as i16
+    vnodes
+        .iter_ones()
+        .next()
+        .unwrap_or(SINGLETON_VNODE.to_index()) as i16
 }
 
 // Drop all the DELETE messages in this chunk and convert UPDATE INSERT into INSERT.
@@ -299,7 +306,7 @@ impl<F: LogStoreFactory, S: StateStore> SinkExecutor<F, S> {
         sink_param: SinkParam,
         columns: Vec<ColumnCatalog>,
         log_store_factory: F,
-        error_table: Option<StateTable<S>>,
+        error_table: Option<ErrorStateTable<S>>,
         chunk_size: usize,
         input_data_types: Vec<DataType>,
         rate_limit: Option<u32>,
@@ -337,18 +344,7 @@ impl<F: LogStoreFactory, S: StateStore> SinkExecutor<F, S> {
             None
         };
 
-        tracing::info!(
-            sink_id = %sink_param.sink_id,
-            actor_id = %actor_context.id,
-            ?non_append_only_behavior,
-            "Sink executor info"
-        );
-
-        let skip_error = sink_param
-            .properties
-            .get(SINK_SKIP_ERROR_OPTION)
-            .map(|value| value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        tracing::info!(sink_id = %sink_param.sink_id, actor_id = %actor_context.id, ?non_append_only_behavior, "Sink executor info");
 
         Ok(Self {
             actor_context,
@@ -359,7 +355,6 @@ impl<F: LogStoreFactory, S: StateStore> SinkExecutor<F, S> {
             sink_param,
             log_store_factory,
             error_table,
-            skip_error,
             sink_writer_param,
             chunk_size,
             input_data_types,
@@ -451,20 +446,26 @@ impl<F: LogStoreFactory, S: StateStore> SinkExecutor<F, S> {
             rate_limit_tx.send(self.rate_limit.into()).unwrap();
 
             let (rebuild_sink_tx, rebuild_sink_rx) = unbounded_channel();
-            let (reported_error_tx, reported_error_rx) = unbounded_channel();
 
             self.log_store_factory
                 .build()
                 .map(move |(log_reader, log_writer)| {
+                    let skip_error = self
+                        .sink_param
+                        .properties
+                        .get(SINK_SKIP_ERROR_OPTION)
+                        .map(|value| value.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
                     let write_log_stream = Self::execute_write_log(
                         processed_input,
                         log_writer.monitored(log_writer_metrics),
+                        self.error_table,
+                        skip_error,
                         actor_id,
                         fragment_id,
                         sink_id,
                         rate_limit_tx,
                         rebuild_sink_tx,
-                        reported_error_tx,
                     );
 
                     let consume_log_stream_future = dispatch_sink!(self.sink, sink, {
@@ -486,14 +487,7 @@ impl<F: LogStoreFactory, S: StateStore> SinkExecutor<F, S> {
 
                         consume_log_stream.boxed()
                     });
-                    let stream = select(consume_log_stream_future.into_stream(), write_log_stream);
-                    Self::execute_error_table_writer(
-                        stream,
-                        self.error_table,
-                        self.skip_error,
-                        reported_error_rx,
-                        actor_id,
-                    )
+                    select(consume_log_stream_future.into_stream(), write_log_stream)
                 })
                 .into_stream()
                 .flatten()
@@ -506,12 +500,13 @@ impl<F: LogStoreFactory, S: StateStore> SinkExecutor<F, S> {
     async fn execute_write_log<W: LogWriter>(
         input: impl MessageStream,
         mut log_writer: W,
+        mut error_table: Option<ErrorStateTable<S>>,
+        skip_error: bool,
         actor_id: ActorId,
         fragment_id: FragmentId,
         sink_id: SinkId,
         rate_limit_tx: UnboundedSender<RateLimit>,
         rebuild_sink_tx: UnboundedSender<RebuildSinkMessage>,
-        reported_error_tx: UnboundedSender<ReportedSinkErrorRows>,
     ) {
         pin_mut!(input);
         let barrier = expect_first_barrier(&mut input).await?;
@@ -521,8 +516,20 @@ impl<F: LogStoreFactory, S: StateStore> SinkExecutor<F, S> {
         yield Message::Barrier(barrier);
 
         log_writer.init(epoch_pair, is_pause_on_startup).await?;
+        if let Some(error_table) = error_table.as_mut() {
+            error_table.init_epoch(epoch_pair).await?;
+        }
 
         let mut is_paused = false;
+        let mut error_vnode = select_error_vnode(
+            error_table
+                .as_ref()
+                .map(ErrorStateTable::vnodes)
+                .map(|v| &**v),
+        );
+        let mut pending_error_rows = PendingErrorRows {
+            rows_by_epoch: vec![],
+        };
 
         #[for_await]
         for msg in input {
@@ -557,12 +564,31 @@ impl<F: LogStoreFactory, S: StateStore> SinkExecutor<F, S> {
                         )
                         .await?;
                     for reported_error_rows in reported_error_rows {
-                        reported_error_tx.send(reported_error_rows).map_err(|_| {
-                            anyhow!("fail to send reported sink error rows to executor")
-                        })?;
+                        pending_error_rows.add_reported_rows(reported_error_rows);
+                    }
+                    if let Some(error_table) = error_table.as_mut() {
+                        if skip_error {
+                            let rows = pending_error_rows.drain_ready_rows(barrier.epoch.curr);
+                            for (row_id, (read_epoch, reported_row)) in rows.into_iter().enumerate()
+                            {
+                                let mut values =
+                                    Vec::with_capacity(reported_row.row.as_inner().len() + 6);
+                                values.push(Some(ScalarImpl::Int64(barrier.epoch.curr as i64)));
+                                values.push(Some(ScalarImpl::Int32(row_id as i32)));
+                                values.push(Some(ScalarImpl::Int16(error_vnode)));
+                                values.push(Some(ScalarImpl::Int16(reported_row.op.to_i16())));
+                                values.push(Some(ScalarImpl::Int64(read_epoch as i64)));
+                                values.push(reported_row.extra_info.map(ScalarImpl::Jsonb));
+                                values.extend(reported_row.row.into_inner().into_vec());
+                                error_table.insert(OwnedRow::new(values));
+                            }
+                        } else {
+                            pending_error_rows.drain_ready_rows(barrier.epoch.curr);
+                        }
                     }
 
                     let mutation = barrier.mutation.clone();
+                    let barrier_epoch = barrier.epoch;
                     yield Message::Barrier(barrier);
                     if F::REBUILD_SINK_ON_UPDATE_VNODE_BITMAP
                         && let Some(new_vnode_bitmap) = update_vnode_bitmap.clone()
@@ -575,6 +601,15 @@ impl<F: LogStoreFactory, S: StateStore> SinkExecutor<F, S> {
                             .map_err(|_| anyhow!("fail to wait rebuild sink finish"))?;
                     }
                     post_flush.post_yield_barrier().await?;
+                    if let Some(error_table) = error_table.as_mut() {
+                        let post_commit = error_table.commit(barrier_epoch).await?;
+                        post_commit
+                            .post_yield_barrier(update_vnode_bitmap.clone())
+                            .await?;
+                        if let Some(new_vnodes) = update_vnode_bitmap.clone() {
+                            error_vnode = select_error_vnode(Some(&new_vnodes));
+                        }
+                    }
 
                     if let Some(mutation) = mutation.as_deref() {
                         match mutation {
@@ -622,57 +657,6 @@ impl<F: LogStoreFactory, S: StateStore> SinkExecutor<F, S> {
                     }
                 }
             }
-        }
-    }
-
-    #[try_stream(ok = Message, error = StreamExecutorError)]
-    async fn execute_error_table_writer(
-        input: impl MessageStream,
-        mut error_table: Option<StateTable<S>>,
-        skip_error: bool,
-        mut reported_error_rx: UnboundedReceiver<ReportedSinkErrorRows>,
-        actor_id: ActorId,
-    ) {
-        pin_mut!(input);
-        let barrier = expect_first_barrier(&mut input).await?;
-        let init_epoch = barrier.epoch;
-        yield Message::Barrier(barrier);
-        if let Some(error_table) = error_table.as_mut() {
-            error_table.init_epoch(init_epoch).await?;
-        }
-
-        let error_vnode = select_error_vnode(error_table.as_ref(), actor_id);
-        let mut pending_error_rows = PendingErrorRows {
-            rows_by_epoch: HashMap::new(),
-            next_row_id_by_epoch: HashMap::new(),
-        };
-
-        #[for_await]
-        for msg in input {
-            let msg = msg?;
-            if let Message::Barrier(barrier) = &msg {
-                while let Ok(reported_error_rows) = reported_error_rx.try_recv() {
-                    pending_error_rows.add_reported_rows(reported_error_rows, error_vnode);
-                }
-
-                if let Some(error_table) = error_table.as_mut() {
-                    if skip_error {
-                        let rows = pending_error_rows.drain_ready_rows(barrier.epoch.curr);
-                        for row in rows {
-                            error_table.insert(row);
-                        }
-                    } else {
-                        pending_error_rows.drain_ready_rows(barrier.epoch.curr);
-                    }
-
-                    let post_commit = error_table.commit(barrier.epoch).await?;
-                    let update_vnode_bitmap = barrier.as_update_vnode_bitmap(actor_id);
-                    yield Message::Barrier(barrier.clone());
-                    post_commit.post_yield_barrier(update_vnode_bitmap).await?;
-                    continue;
-                }
-            }
-            yield msg;
         }
     }
 

@@ -46,17 +46,75 @@ async fn start_error_table_test_cluster() -> Result<Cluster> {
     .await
 }
 
-async fn find_latest_error_table_name(session: &mut Session, sink_name: &str) -> Result<String> {
+async fn find_error_table_names(session: &mut Session, sink_name: &str) -> Result<Vec<String>> {
     let table_name_prefix = format!("public.__internal_{}_", sink_name);
     let internal_tables = session.run("show internal tables").await?;
-    internal_tables
+    let table_names = internal_tables
         .lines()
         .filter(|line| {
             line.contains(&table_name_prefix) && line.to_ascii_lowercase().contains("sinkerror")
         })
         .map(str::to_owned)
+        .sorted()
+        .collect_vec();
+    if table_names.is_empty() {
+        return Err(anyhow::anyhow!(
+            "failed to find sink error internal table for {sink_name}"
+        ));
+    }
+    Ok(table_names)
+}
+
+async fn find_log_store_table_name(session: &mut Session, sink_name: &str) -> Result<String> {
+    let table_name_prefix = format!("public.__internal_{}_", sink_name);
+    let internal_tables = session.run("show internal tables").await?;
+    internal_tables
+        .lines()
+        .filter(|line| {
+            line.contains(&table_name_prefix)
+                && !line.to_ascii_lowercase().contains("sinkerror")
+                && line
+                    .strip_prefix(&table_name_prefix)
+                    .is_some_and(|suffix| suffix.contains("sink"))
+        })
+        .map(str::to_owned)
         .max()
-        .ok_or_else(|| anyhow::anyhow!("failed to find sink error internal table for {sink_name}"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("failed to find sink log store internal table for {sink_name}")
+        })
+}
+
+async fn find_error_table_name(
+    session: &mut Session,
+    sink_name: &str,
+    required_columns: &[&str],
+) -> Result<String> {
+    let mut last_describes = Vec::new();
+    for attempt in 0..100 {
+        let table_names = find_error_table_names(session, sink_name).await?;
+        last_describes.clear();
+        for table_name in table_names.iter().rev() {
+            let describe = session.run(format!("describe {}", table_name)).await?;
+            last_describes.push(format!("{table_name}:\n{describe}"));
+            if required_columns.iter().all(|column| {
+                describe
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(*column))
+            }) {
+                return Ok(table_name.clone());
+            }
+        }
+        if attempt % 5 == 4 {
+            session.run("flush").await?;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow::anyhow!(
+        "failed to find sink error internal table for {} with required columns {:?}. candidates:\n{}",
+        sink_name,
+        required_columns,
+        last_describes.join("\n---\n")
+    ))
 }
 
 async fn wait_for_error_table_count(
@@ -129,7 +187,7 @@ async fn run_sink_error_table_test(decouple: bool) -> Result<()> {
     let test_sink = SimulationTestSink::register_new(TestSinkType::ReportError);
 
     let mut session = cluster.start_session();
-    session.run("set streaming_parallelism = 2").await?;
+    session.run("set streaming_parallelism = 1").await?;
     session
         .run(format!("set sink_decouple = {}", decouple))
         .await?;
@@ -137,7 +195,7 @@ async fn run_sink_error_table_test(decouple: bool) -> Result<()> {
         .run("create table test_table_error (id int primary key, name varchar)")
         .await?;
     session
-        .run("create sink test_sink_error from test_table_error with (connector = 'test', type = 'upsert', skip_error = 'true', auto_schema_change = 'true')")
+        .run("create sink test_sink_error from test_table_error with (connector = 'test', type = 'upsert', skip_error = 'true', auto.schema.change = 'true')")
         .await?;
 
     let initial_ids = 0..5;
@@ -156,7 +214,7 @@ async fn run_sink_error_table_test(decouple: bool) -> Result<()> {
 
     session.run("flush").await?;
     let initial_error_table_name =
-        find_latest_error_table_name(&mut session, "test_sink_error").await?;
+        find_error_table_name(&mut session, "test_sink_error", &["id", "name"]).await?;
     wait_for_error_table_count(&mut session, &initial_error_table_name, initial_ids.len()).await?;
 
     let initial_rows = session
@@ -181,6 +239,25 @@ async fn run_sink_error_table_test(decouple: bool) -> Result<()> {
     session
         .run("alter table test_table_error add column age int")
         .await?;
+    let mut schema_session = cluster.start_session();
+    let log_store_table_name =
+        find_log_store_table_name(&mut schema_session, "test_sink_error").await?;
+    let log_store_describe = schema_session
+        .run(format!("describe {}", log_store_table_name))
+        .await?;
+    assert!(
+        log_store_describe
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("test_table_error_age")),
+        "log store table schema is not updated:\n{}",
+        log_store_describe
+    );
+    let latest_error_table_name = find_error_table_name(
+        &mut schema_session,
+        "test_sink_error",
+        &["id", "name", "age"],
+    )
+    .await?;
 
     let new_ids = 5..10;
     session
@@ -196,8 +273,6 @@ async fn run_sink_error_table_test(decouple: bool) -> Result<()> {
     test_sink.store.wait_for_count(new_ids.end as usize).await?;
 
     session.run("flush").await?;
-    let latest_error_table_name =
-        find_latest_error_table_name(&mut session, "test_sink_error").await?;
     let expected_row_count = if latest_error_table_name == initial_error_table_name {
         new_ids.end as usize
     } else {

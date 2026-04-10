@@ -1590,14 +1590,8 @@ impl DdlController {
                             tmp_sink_id: sink.tmp_sink_id,
                             original_sink_id: sink.original_sink.id,
                             columns: sink.new_schema.clone(),
-                            new_log_store_table: sink
-                                .new_log_store_table
-                                .as_ref()
-                                .map(|table| (table.id, table.columns.clone())),
-                            new_error_table: sink
-                                .new_error_table
-                                .as_ref()
-                                .map(|table| (table.id, table.columns.clone())),
+                            new_log_store_table: sink.new_log_store_table.clone(),
+                            new_error_table: sink.new_error_table.clone(),
                         })
                         .collect()
                 });
@@ -1656,20 +1650,21 @@ impl DdlController {
 
         match result {
             Ok((replace_upstream, auto_refresh_schema_sink_finish_ctx)) => {
-                let version = self
-                    .metadata_manager
-                    .catalog_controller
-                    .finish_replace_streaming_job(
-                        tmp_id,
-                        streaming_job,
-                        replace_upstream,
-                        SinkIntoTableContext {
-                            updated_sink_catalogs,
-                        },
-                        drop_table_connector_ctx.as_ref(),
-                        auto_refresh_schema_sink_finish_ctx,
-                    )
-                    .await?;
+                let version = Box::pin(
+                    self.metadata_manager
+                        .catalog_controller
+                        .finish_replace_streaming_job(
+                            tmp_id,
+                            streaming_job,
+                            replace_upstream,
+                            SinkIntoTableContext {
+                                updated_sink_catalogs,
+                            },
+                            drop_table_connector_ctx.as_ref(),
+                            auto_refresh_schema_sink_finish_ctx,
+                        ),
+                )
+                .await?;
                 if let Some(drop_table_connector_ctx) = &drop_table_connector_ctx {
                     self.source_manager
                         .apply_source_change(SourceChange::DropSource {

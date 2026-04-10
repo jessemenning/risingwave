@@ -39,10 +39,9 @@ use risingwave_connector::sink::log_store::LogStoreResult;
 use risingwave_hummock_sdk::HummockEpoch;
 use risingwave_hummock_sdk::key::{TableKey, next_key};
 use risingwave_pb::catalog::Table;
-use risingwave_storage::error::StorageResult;
 use risingwave_storage::row_serde::row_serde_util::{serialize_pk, serialize_pk_with_vnode};
 use risingwave_storage::row_serde::value_serde::ValueRowSerdeNew;
-use risingwave_storage::store::{StateStoreIterExt, StateStoreReadIter};
+use risingwave_storage::store::StateStoreReadIter;
 use risingwave_storage::table::{SINGLETON_VNODE, compute_vnode};
 use rw_futures_util::select_all;
 
@@ -773,19 +772,25 @@ mod stream_de {
         iter: S,
         serde: LogStoreRowSerde,
     ) -> LogStoreItemStream<S> {
-        may_merge_update(
-            iter.into_stream(move |(key, value)| -> StorageResult<RawLogStoreRow> {
-                let size = key.user_key.table_key.len() + value.len();
-                let (epoch, op) = serde.deserialize(value)?;
-                let row_meta = RowMeta { vnode, epoch, size };
-                tracing::trace!(?row_meta, ?op, "read_row");
-                Ok(RawLogStoreRow { op, row_meta })
-            })
-            .map_err(Into::into),
-        )
-        .boxed()
+        may_merge_update(deserialize_raw_stream(vnode, iter, serde)).boxed()
         // The `boxed` call was unnecessary in usual build. But when doing cargo doc,
         // rustc will panic in auto_trait.rs. May remove it when using future version of tool chain.
+    }
+
+    #[try_stream(ok = RawLogStoreRow, error = anyhow::Error)]
+    async fn deserialize_raw_stream<S: StateStoreReadIter>(
+        vnode: VirtualNode,
+        iter: S,
+        serde: LogStoreRowSerde,
+    ) {
+        let mut iter = iter;
+        while let Some((key, value)) = iter.try_next().await? {
+            let size = key.user_key.table_key.len() + value.len();
+            let (epoch, op) = serde.deserialize(value)?;
+            let row_meta = RowMeta { vnode, epoch, size };
+            tracing::trace!(?row_meta, ?op, "read_row");
+            yield RawLogStoreRow { op, row_meta };
+        }
     }
 
     #[try_stream(ok = LogStoreRow, error = anyhow::Error)]

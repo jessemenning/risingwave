@@ -509,6 +509,7 @@ fn rewrite_log_store_table(
     extend_sink_columns(&mut log_store_table.columns, newly_added_columns, |name| {
         format!("{}_{}", upstream_table_name, name)
     });
+    log_store_table.value_indices = (0..log_store_table.columns.len() as i32).collect();
 }
 
 /// Rewrite sink error table columns for schema change.
@@ -523,6 +524,7 @@ fn rewrite_sink_error_table(
     extend_sink_columns(&mut error_table.columns, newly_added_columns, |name| {
         name.clone()
     });
+    error_table.value_indices = (0..error_table.columns.len() as i32).collect();
 }
 
 /// Rewrite `StreamScan` + Merge to match the new upstream schema.
@@ -747,6 +749,15 @@ fn rewrite_project_node(
     Ok(())
 }
 
+/// Result of `rewrite_refresh_schema_sink_fragment`:
+/// (new fragment, new column catalogs, new log store table, new error table)
+type RewriteSinkFragmentResult = (
+    Fragment,
+    Vec<PbColumnCatalog>,
+    Option<PbTable>,
+    Option<PbTable>,
+);
+
 pub fn rewrite_refresh_schema_sink_fragment(
     original_sink_fragment: &Fragment,
     sink: &PbSink,
@@ -755,12 +766,7 @@ pub fn rewrite_refresh_schema_sink_fragment(
     upstream_table: &PbTable,
     upstream_table_fragment_id: FragmentId,
     id_generator_manager: &IdGeneratorManager,
-) -> MetaResult<(
-    Fragment,
-    Vec<PbColumnCatalog>,
-    Option<PbTable>,
-    Option<PbTable>,
-)> {
+) -> MetaResult<RewriteSinkFragmentResult> {
     let removed_column_ids: HashSet<_> =
         removed_columns.iter().map(|col| col.column_id()).collect();
     let removed_sink_column_names: HashSet<_> = removed_columns
@@ -2437,16 +2443,6 @@ mod tests {
             value_indices: (0..columns.len()).map(|i| i as i32).collect(),
             ..Default::default()
         };
-        let error_table = PbTable {
-            columns: columns
-                .iter()
-                .cloned()
-                .map(|col| col.to_protobuf())
-                .collect(),
-            value_indices: (0..columns.len()).map(|i| i as i32).collect(),
-            ..Default::default()
-        };
-
         let original_fragment = Fragment {
             fragment_id: 1.into(),
             fragment_type_mask: FragmentTypeMask::default(),
@@ -2566,6 +2562,11 @@ mod tests {
                     col.to_protobuf()
                 })
                 .collect(),
+            value_indices: (0..columns.len()).map(|i| i as i32).collect(),
+            ..Default::default()
+        };
+        let error_table = PbTable {
+            columns: columns.iter().map(|col| col.to_protobuf()).collect(),
             value_indices: (0..columns.len()).map(|i| i as i32).collect(),
             ..Default::default()
         };

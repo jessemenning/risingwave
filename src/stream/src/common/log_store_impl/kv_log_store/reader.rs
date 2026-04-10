@@ -536,18 +536,23 @@ impl<S: StateStoreRead> LogReader for KvLogStoreReader<S> {
             self.truncate_offset = Some(offset);
         } else {
             // For historical data, no need to truncate at seq id level. Only truncate at barrier.
-            if let TruncateOffset::Barrier { epoch } = &offset {
-                if let Some(truncate_offset) = &self.truncate_offset
-                    && offset <= *truncate_offset
-                {
-                    return Err(anyhow!(
-                        "truncate offset {:?} earlier than prev truncate offset {:?}",
-                        offset,
-                        truncate_offset
-                    ));
+            match offset {
+                TruncateOffset::Chunk { epoch, .. } => {
+                    self.rx.buffer_historical_truncate_rows(epoch, error_rows);
                 }
-                self.rx.truncate_historical(*epoch, error_rows);
-                self.truncate_offset = Some(offset);
+                TruncateOffset::Barrier { epoch } => {
+                    if let Some(truncate_offset) = &self.truncate_offset
+                        && offset <= *truncate_offset
+                    {
+                        return Err(anyhow!(
+                            "truncate offset {:?} earlier than prev truncate offset {:?}",
+                            offset,
+                            truncate_offset
+                        ));
+                    }
+                    self.rx.truncate_historical(epoch, error_rows);
+                    self.truncate_offset = Some(offset);
+                }
             }
         }
         Ok(())

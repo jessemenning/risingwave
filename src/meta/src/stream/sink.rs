@@ -15,7 +15,7 @@
 use anyhow::Context;
 use risingwave_connector::dispatch_sink;
 use risingwave_connector::sink::catalog::SinkCatalog;
-use risingwave_connector::sink::{SINK_SKIP_ERROR_OPTION, Sink, SinkParam, build_sink};
+use risingwave_connector::sink::{Sink, SinkParam, build_sink};
 use risingwave_pb::catalog::PbSink;
 
 use crate::MetaResult;
@@ -24,19 +24,9 @@ use crate::MetaResult;
 pub async fn validate_sink(prost_sink_catalog: &PbSink) -> MetaResult<()> {
     let sink_catalog = SinkCatalog::from(prost_sink_catalog);
     let param = SinkParam::try_from_sink_catalog(sink_catalog)?;
-    let skip_error_requested = param.properties.contains_key(SINK_SKIP_ERROR_OPTION);
-
     let sink = build_sink(param)?;
 
     dispatch_sink!(sink, sink, {
-        if skip_error_requested && !sink.support_skip_error() {
-            return Err(anyhow::anyhow!(
-                "sink {} does not support the `{}` option",
-                prost_sink_catalog.name,
-                SINK_SKIP_ERROR_OPTION
-            )
-            .into());
-        }
         Ok(sink.validate().await.context("failed to validate sink")?)
     })
 }

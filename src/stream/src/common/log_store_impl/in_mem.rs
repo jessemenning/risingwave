@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-
 use anyhow::{Context, anyhow};
 use await_tree::InstrumentAwait;
 use futures::FutureExt;
@@ -56,9 +54,8 @@ pub struct BoundedInMemLogStoreWriter {
     /// Sending log store item to log reader
     item_tx: Sender<InMemLogStoreItem>,
 
-    /// Receiver for the epoch consumed by log reader.
-    truncated_epoch_rx: UnboundedReceiver<u64>,
-    reported_error_rx: UnboundedReceiver<ReportedSinkErrorRows>,
+    /// Receiver for the epoch consumed by log reader together with its reported error rows.
+    truncated_epoch_rx: UnboundedReceiver<ReportedSinkErrorRows>,
 
     wait_init_epoch: Option<WaitInitEpochFn>,
 }
@@ -84,16 +81,15 @@ pub struct BoundedInMemLogStoreReader {
     /// Receiver to fetch log store item
     item_rx: Receiver<InMemLogStoreItem>,
 
-    /// Sender of consumed epoch to the log writer
-    truncated_epoch_tx: UnboundedSender<u64>,
-    reported_error_tx: UnboundedSender<ReportedSinkErrorRows>,
+    /// Sender of consumed epoch to the log writer together with its reported error rows.
+    truncated_epoch_tx: UnboundedSender<ReportedSinkErrorRows>,
 
     /// Offset of the latest emitted item
     latest_offset: TruncateOffset,
 
     /// Offset of the latest truncated item
     truncate_offset: TruncateOffset,
-    pending_reported_error_rows: HashMap<u64, Vec<ReportedSinkErrorRow>>,
+    pending_reported_error_rows: Vec<(u64, Vec<ReportedSinkErrorRow>)>,
 }
 
 type WaitInitEpochFn =
@@ -137,23 +133,20 @@ impl LogStoreFactory for BoundedInMemLogStoreFactory {
         let (init_epoch_tx, init_epoch_rx) = oneshot::channel();
         let (item_tx, item_rx) = channel(self.bound);
         let (truncated_epoch_tx, truncated_epoch_rx) = unbounded_channel();
-        let (reported_error_tx, reported_error_rx) = unbounded_channel();
         let reader = BoundedInMemLogStoreReader {
             epoch_progress: UNINITIALIZED,
             init_epoch_rx: Some(init_epoch_rx),
             item_rx,
             truncated_epoch_tx,
-            reported_error_tx,
             latest_offset: TruncateOffset::Barrier { epoch: 0 },
             truncate_offset: TruncateOffset::Barrier { epoch: 0 },
-            pending_reported_error_rows: HashMap::new(),
+            pending_reported_error_rows: vec![],
         };
         let writer = BoundedInMemLogStoreWriter {
             curr_epoch: None,
             init_epoch_tx: Some(init_epoch_tx),
             item_tx,
             truncated_epoch_rx,
-            reported_error_rx,
             wait_init_epoch: Some(self.wait_init_epoch),
         };
         (reader, writer)
@@ -265,10 +258,19 @@ impl LogReader for BoundedInMemLogStoreReader {
         }
 
         if !error_rows.is_empty() {
-            self.pending_reported_error_rows
-                .entry(offset.epoch())
-                .or_default()
-                .extend(error_rows);
+            if self
+                .pending_reported_error_rows
+                .last()
+                .is_none_or(|(epoch, _)| *epoch != offset.epoch())
+            {
+                self.pending_reported_error_rows
+                    .push((offset.epoch(), vec![]));
+            }
+            let (_, rows) = self
+                .pending_reported_error_rows
+                .last_mut()
+                .expect("pending reported error rows should have current epoch");
+            rows.extend(error_rows);
         }
 
         if let AwaitingTruncate {
@@ -280,19 +282,21 @@ impl LogReader for BoundedInMemLogStoreReader {
         {
             let sealed_epoch = *sealed_epoch;
             self.epoch_progress = Consuming(*next_epoch);
-            self.truncated_epoch_tx
-                .send(sealed_epoch)
-                .map_err(|_| anyhow!("unable to send sealed epoch"))?;
-        }
-
-        if let TruncateOffset::Barrier { epoch } = offset {
-            let rows = self
+            let rows = if self
                 .pending_reported_error_rows
-                .remove(&epoch)
-                .unwrap_or_default();
-            self.reported_error_tx
-                .send(ReportedSinkErrorRows { epoch, rows })
-                .map_err(|_| anyhow!("unable to send reported sink error rows"))?;
+                .first()
+                .is_some_and(|(epoch, _)| *epoch == sealed_epoch)
+            {
+                self.pending_reported_error_rows.remove(0).1
+            } else {
+                vec![]
+            };
+            self.truncated_epoch_tx
+                .send(ReportedSinkErrorRows {
+                    epoch: sealed_epoch,
+                    rows,
+                })
+                .map_err(|_| anyhow!("unable to send sealed epoch"))?;
         }
         self.truncate_offset = offset;
         Ok(())
@@ -356,17 +360,14 @@ impl LogWriter for BoundedInMemLogStoreWriter {
             .expect("should have epoch");
 
         if is_checkpoint {
-            let truncated_epoch = self
+            let truncated = self
                 .truncated_epoch_rx
                 .recv()
                 .instrument_await("in_mem_recv_truncated_epoch")
                 .await
                 .ok_or_else(|| anyhow!("cannot get truncated epoch"))?;
-            assert_eq!(truncated_epoch, prev_epoch);
-        }
-
-        while let Ok(rows) = self.reported_error_rx.try_recv() {
-            reported_error_rows.push(rows);
+            assert_eq!(truncated.epoch, prev_epoch);
+            reported_error_rows.push(truncated);
         }
 
         Ok(FlushCurrentEpochResult {

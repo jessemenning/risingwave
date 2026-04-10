@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
-use std::fmt::Debug;
+use std::collections::VecDeque;
 use std::future::{Future, pending, poll_fn};
 use std::pin::pin;
 use std::sync::Arc;
@@ -152,14 +151,14 @@ pub struct FlushCurrentEpochOptions {
     pub schema_change: Option<PbSinkSchemaChange>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ReportedSinkErrorRow {
     pub op: Op,
     pub row: OwnedRow,
     pub extra_info: Option<JsonbVal>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ReportedSinkErrorRows {
     pub epoch: u64,
     pub rows: Vec<ReportedSinkErrorRow>,
@@ -407,22 +406,31 @@ impl<R: LogReader> LogReader for MonitoredLogReader<R> {
     }
 }
 
-#[derive(Copy, Clone, PartialOrd, PartialEq, Eq, Hash, Debug)]
+#[derive(Copy, Clone, PartialOrd, PartialEq, Debug)]
 struct UpstreamChunkOffset(TruncateOffset);
 #[derive(Copy, Clone, PartialOrd, PartialEq)]
 struct DownstreamChunkOffset(TruncateOffset);
 
+struct ConsumedOffsets {
+    upstream_offset: UpstreamChunkOffset,
+    // Newer items at the front, push_front, pop_back
+    downstream_offsets: VecDeque<DownstreamChunkOffset>,
+    reported_error_rows: Vec<ReportedSinkErrorRow>,
+}
+
+type ConsumingChunk = (
+    UpstreamChunkOffset,
+    // Newer items at the front, push_front, pop_back
+    VecDeque<DownstreamChunkOffset>,
+    Vec<StreamChunk>, // split chunks
+    Vec<ReportedSinkErrorRow>,
+);
+
 struct RateLimitedLogReaderCore<R: LogReader> {
     inner: R,
-    consuming_chunk: Option<(
-        UpstreamChunkOffset,
-        // Newer items at the front, push_front, pop_back
-        VecDeque<DownstreamChunkOffset>,
-        Vec<StreamChunk>, // split chunks
-    )>,
+    consuming_chunk: Option<ConsumingChunk>,
     // Newer items at the front, push_front, pop_back
-    consumed_offset_queue: VecDeque<(UpstreamChunkOffset, VecDeque<DownstreamChunkOffset>)>,
-    pending_error_rows: HashMap<UpstreamChunkOffset, Vec<ReportedSinkErrorRow>>,
+    consumed_offset_queue: VecDeque<ConsumedOffsets>,
     next_chunk_id: usize,
     rate_limiter: RateLimiter,
 }
@@ -439,7 +447,6 @@ impl<R: LogReader> RateLimitedLogReader<R> {
                 inner,
                 consuming_chunk: None,
                 consumed_offset_queue: VecDeque::new(),
-                pending_error_rows: HashMap::new(),
                 next_chunk_id: 0,
                 rate_limiter: RateLimiter::new(RateLimit::Disabled),
             },
@@ -452,11 +459,11 @@ impl<R: LogReader> RateLimitedLogReaderCore<R> {
     fn peek_next_pending_chunk(&self) -> Option<&StreamChunk> {
         self.consuming_chunk
             .as_ref()
-            .and_then(|(_, _, chunk)| chunk.last())
+            .and_then(|(_, _, chunk, _)| chunk.last())
     }
 
     fn consume_next_pending_chunk(&mut self) -> Option<(u64, StreamChunk, ChunkId)> {
-        let Some((upstream_offset, consumed_offsets, pending_chunk)) = &mut self.consuming_chunk
+        let Some((upstream_offset, consumed_offsets, pending_chunk, _)) = &mut self.consuming_chunk
         else {
             return None;
         };
@@ -472,10 +479,13 @@ impl<R: LogReader> RateLimitedLogReaderCore<R> {
             (epoch, chunk, chunk_id)
         });
         if pending_chunk.is_empty() {
-            let (upstream_offset, consumed_offsets, _) =
+            let (upstream_offset, consumed_offsets, _, reported_error_rows) =
                 self.consuming_chunk.take().expect("checked some");
-            self.consumed_offset_queue
-                .push_front((upstream_offset, consumed_offsets));
+            self.consumed_offset_queue.push_front(ConsumedOffsets {
+                upstream_offset,
+                downstream_offsets: consumed_offsets,
+                reported_error_rows,
+            });
         }
         item
     }
@@ -508,8 +518,11 @@ impl<R: LogReader> RateLimitedLogReaderCore<R> {
                 DownstreamChunkOffset(TruncateOffset::Barrier { epoch }),
             ),
         };
-        self.consumed_offset_queue
-            .push_front((upstream_offset, VecDeque::from_iter([downstream_offset])));
+        self.consumed_offset_queue.push_front(ConsumedOffsets {
+            upstream_offset,
+            downstream_offsets: VecDeque::from_iter([downstream_offset]),
+            reported_error_rows: vec![],
+        });
         (epoch, item)
     }
 
@@ -548,6 +561,7 @@ impl<R: LogReader> RateLimitedLogReaderCore<R> {
                                         }),
                                         VecDeque::new(),
                                         chunks,
+                                        vec![],
                                     ))
                                     .is_none()
                             );
@@ -599,44 +613,55 @@ impl<R: LogReader> LogReader for RateLimitedLogReader<R> {
     ) -> LogStoreResult<()> {
         let downstream_offset = DownstreamChunkOffset(offset);
         let mut truncate_offset = None;
-        let mut affected_upstream_offset = None;
+        let mut pending_error_rows = error_rows;
+        let mut truncate_error_rows = vec![];
         let mut stop = false;
-        'outer: while let Some((upstream_offset, downstream_offsets)) =
-            self.core.consumed_offset_queue.back_mut()
-        {
-            while let Some(prev_downstream_offset) = downstream_offsets.back() {
+        'outer: while let Some(consumed_offsets) = self.core.consumed_offset_queue.back_mut() {
+            while let Some(prev_downstream_offset) = consumed_offsets.downstream_offsets.back() {
                 if *prev_downstream_offset <= downstream_offset {
-                    downstream_offsets.pop_back();
-                    affected_upstream_offset = Some(*upstream_offset);
+                    consumed_offsets.downstream_offsets.pop_back();
+                    if !pending_error_rows.is_empty() {
+                        consumed_offsets
+                            .reported_error_rows
+                            .append(&mut pending_error_rows);
+                    }
                 } else {
                     stop = true;
                     break 'outer;
                 }
             }
-            truncate_offset = Some(*upstream_offset);
-            self.core.consumed_offset_queue.pop_back();
+            if consumed_offsets.downstream_offsets.is_empty() {
+                let consumed_offsets = self
+                    .core
+                    .consumed_offset_queue
+                    .pop_back()
+                    .expect("checked some");
+                truncate_offset = Some(consumed_offsets.upstream_offset);
+                truncate_error_rows.extend(consumed_offsets.reported_error_rows);
+            } else {
+                break;
+            }
         }
         if !stop
-            && let Some((upstream_offset, downstream_offsets, _)) = &mut self.core.consuming_chunk
+            && let Some((_, downstream_offsets, _, reported_error_rows)) =
+                &mut self.core.consuming_chunk
         {
             while let Some(prev_downstream_offset) = downstream_offsets.back() {
                 if *prev_downstream_offset <= downstream_offset {
                     downstream_offsets.pop_back();
-                    affected_upstream_offset = Some(*upstream_offset);
+                    if !pending_error_rows.is_empty() {
+                        reported_error_rows.append(&mut pending_error_rows);
+                    }
                 } else {
-                    // stop = true;
                     break;
                 }
             }
-        }
-        if !error_rows.is_empty()
-            && let Some(upstream_offset) = affected_upstream_offset
-        {
-            self.core
-                .pending_error_rows
-                .entry(upstream_offset)
-                .or_default()
-                .extend(error_rows);
+            if downstream_offsets.is_empty() {
+                let (upstream_offset, _, _, reported_error_rows) =
+                    self.core.consuming_chunk.take().expect("checked some");
+                truncate_offset = Some(upstream_offset);
+                truncate_error_rows.extend(reported_error_rows);
+            }
         }
         tracing::trace!(
             "rate limited log store reader truncate offset {:?}, downstream offset {:?}",
@@ -644,12 +669,7 @@ impl<R: LogReader> LogReader for RateLimitedLogReader<R> {
             offset
         );
         if let Some(offset) = truncate_offset {
-            let error_rows = self
-                .core
-                .pending_error_rows
-                .remove(&offset)
-                .unwrap_or_default();
-            self.core.inner.truncate(offset.0, error_rows)
+            self.core.inner.truncate(offset.0, truncate_error_rows)
         } else {
             Ok(())
         }

@@ -63,10 +63,6 @@ impl Sink for TestSink {
         true
     }
 
-    fn support_skip_error(&self) -> bool {
-        true
-    }
-
     async fn validate(&self) -> crate::sink::Result<()> {
         Ok(())
     }

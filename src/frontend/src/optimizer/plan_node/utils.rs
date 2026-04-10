@@ -23,8 +23,8 @@ use fixedbitset::FixedBitSet;
 use itertools::Itertools;
 use pretty_xmlish::{Pretty, Str, StrAssocArr, XmlNode};
 use risingwave_common::catalog::{
-    ColumnCatalog, ColumnDesc, ConflictBehavior, CreateType, Engine, Field, FieldDisplay, Schema,
-    StreamJobStatus,
+    ColumnCatalog, ColumnDesc, ConflictBehavior, CreateType, Engine, Field, FieldDisplay,
+    INITIAL_TABLE_VERSION_ID, Schema, StreamJobStatus,
 };
 use risingwave_common::constants::log_store::v2::{
     KV_LOG_STORE_PREDEFINED_COLUMNS, PK_ORDERING, VNODE_COLUMN_INDEX,
@@ -46,7 +46,7 @@ use risingwave_sqlparser::ast::AsOf;
 
 use super::generic::{self, GenericPlanRef, PhysicalPlanRef};
 use super::{BatchPlanRef, StreamPlanRef, pretty_config};
-use crate::catalog::table_catalog::TableType;
+use crate::catalog::table_catalog::{TableType, TableVersion};
 use crate::catalog::{ColumnId, FragmentId, TableCatalog, TableId};
 use crate::error::{ErrorCode, Result};
 use crate::expr::InputRef;
@@ -451,7 +451,20 @@ pub fn infer_sink_error_table_catalog_inner(columns: &[ColumnCatalog]) -> TableC
     }
 
     table_catalog_builder.set_value_indices(value_indices);
-    table_catalog_builder.build(vec![SINK_ERROR_VNODE_COLUMN_INDEX], read_prefix_len_hint)
+    let mut table =
+        table_catalog_builder.build(vec![SINK_ERROR_VNODE_COLUMN_INDEX], read_prefix_len_hint);
+    let next_column_id = table
+        .columns
+        .iter()
+        .map(|column| column.column_desc.column_id)
+        .max()
+        .expect("sink error table should have columns")
+        .next();
+    table.version = Some(TableVersion {
+        version_id: INITIAL_TABLE_VERSION_ID,
+        next_column_id,
+    });
+    table
 }
 
 pub fn infer_synced_kv_log_store_table_catalog_inner(
@@ -505,8 +518,8 @@ mod tests {
     use itertools::Itertools;
     use risingwave_common::catalog::{ColumnCatalog, ColumnDesc};
     use risingwave_common::constants::sink_error::{
-        EPOCH_COLUMN_NAME, EXTRA_INFO_COLUMN_NAME, PREDEFINED_COLUMNS, ROW_ID_COLUMN_NAME,
-        ROW_OP_COLUMN_NAME, VNODE_COLUMN_INDEX, VNODE_COLUMN_NAME,
+        EPOCH_COLUMN_NAME, EXTRA_INFO_COLUMN_NAME, PREDEFINED_COLUMNS, READ_EPOCH_COLUMN_NAME,
+        ROW_ID_COLUMN_NAME, ROW_OP_COLUMN_NAME, VNODE_COLUMN_INDEX, VNODE_COLUMN_NAME,
     };
     use risingwave_common::types::DataType;
 
@@ -540,6 +553,7 @@ mod tests {
                 ROW_ID_COLUMN_NAME,
                 VNODE_COLUMN_NAME,
                 ROW_OP_COLUMN_NAME,
+                READ_EPOCH_COLUMN_NAME,
                 EXTRA_INFO_COLUMN_NAME,
                 "name",
                 "id",

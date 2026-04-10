@@ -754,7 +754,7 @@ impl StreamSink {
     }
 
     /// The error table schema is:
-    /// | error epoch | error row id | vnode | row op | extra info | visible sink columns |
+    /// | write epoch | error row id | vnode | row op | read epoch | extra info | visible sink columns |
     /// Pk is: | error epoch | vnode | error row id |
     fn infer_sink_error_table_catalog(&self) -> TableCatalog {
         infer_sink_error_table_catalog_inner(self.sink_desc().columns.as_slice())

@@ -81,6 +81,7 @@ struct LogStoreBufferInner {
     chunk_size: usize,
 
     truncation_list: VecDeque<ReaderTruncationProgress>,
+    pending_truncation_list: VecDeque<ReaderTruncationProgress>,
 
     next_chunk_id: ChunkId,
 
@@ -229,17 +230,44 @@ impl LogStoreBufferInner {
     }
 
     fn add_truncate_offset(&mut self, progress: ReaderTruncationProgress) {
-        let (epoch, seq_id) = progress.offset;
         if let Some(prev_progress) = self.truncation_list.back_mut()
-            && prev_progress.offset.0 == epoch
+            && prev_progress.offset.0 == progress.offset.0
         {
-            prev_progress.offset.1 = seq_id;
+            prev_progress.offset.1 = progress.offset.1;
             prev_progress
                 .reported_error_rows
                 .extend(progress.reported_error_rows);
         } else {
             self.truncation_list.push_back(progress);
         }
+    }
+
+    fn add_pending_truncate_rows(&mut self, progress: ReaderTruncationProgress) {
+        if let Some(prev_progress) = self.pending_truncation_list.back_mut()
+            && prev_progress.offset.0 == progress.offset.0
+        {
+            prev_progress
+                .reported_error_rows
+                .extend(progress.reported_error_rows);
+        } else {
+            self.pending_truncation_list.push_back(progress);
+        }
+    }
+
+    fn take_pending_truncate_rows(&mut self, epoch: u64) -> Vec<ReportedSinkErrorRow> {
+        let mut rows = vec![];
+        while self
+            .pending_truncation_list
+            .front()
+            .is_some_and(|progress| progress.offset.0 <= epoch)
+        {
+            let progress = self
+                .pending_truncation_list
+                .pop_front()
+                .expect("checked some");
+            rows.extend(progress.reported_error_rows);
+        }
+        rows
     }
 
     fn rewind(&mut self, log_store_rewind_start_epoch: Option<u64>) {
@@ -249,6 +277,7 @@ impl LogStoreBufferInner {
                 self.unconsumed_queue.push_back((epoch, item));
             }
         }
+        self.pending_truncation_list.clear();
         self.update_buffer_metrics();
     }
 
@@ -257,6 +286,7 @@ impl LogStoreBufferInner {
         self.unconsumed_queue.clear();
         self.next_chunk_id = 0;
         self.truncation_list.clear();
+        self.pending_truncation_list.clear();
         self.row_count = 0;
     }
 }
@@ -350,7 +380,7 @@ impl LogStoreBufferSender {
         let mut latest_offset = None;
         let mut reported_error_rows = vec![];
         while let Some(progress) = inner.truncation_list.front()
-            && progress.offset.0 < curr_epoch
+            && progress.offset.0 <= curr_epoch
         {
             let progress = inner.truncation_list.pop_front().expect("checked some");
             latest_offset = Some(progress.offset);
@@ -465,6 +495,7 @@ impl LogStoreBufferReceiver {
     ) {
         let mut inner = self.buffer.inner();
         let mut latest_offset: Option<ReaderTruncationOffsetType> = None;
+        let offset_epoch = offset.epoch();
         while let Some((epoch, item)) = inner.consumed_queue.back() {
             let epoch = *epoch;
             match item {
@@ -521,12 +552,34 @@ impl LogStoreBufferReceiver {
         }
         inner.update_buffer_metrics();
         if let Some(offset) = latest_offset {
+            let mut merged_error_rows = inner.take_pending_truncate_rows(offset.0);
+            merged_error_rows.extend(reported_error_rows);
             inner.add_truncate_offset(ReaderTruncationProgress {
                 offset,
-                reported_error_rows,
+                reported_error_rows: merged_error_rows,
             });
             self.truncate_notify.notify_waiters();
+        } else if !reported_error_rows.is_empty() {
+            inner.add_pending_truncate_rows(ReaderTruncationProgress {
+                offset: (offset_epoch, None),
+                reported_error_rows,
+            });
         }
+    }
+
+    pub(crate) fn buffer_historical_truncate_rows(
+        &mut self,
+        epoch: u64,
+        reported_error_rows: Vec<ReportedSinkErrorRow>,
+    ) {
+        if reported_error_rows.is_empty() {
+            return;
+        }
+        let mut inner = self.buffer.inner();
+        inner.add_pending_truncate_rows(ReaderTruncationProgress {
+            offset: (epoch, None),
+            reported_error_rows,
+        });
     }
 
     pub(crate) fn truncate_historical(
@@ -535,9 +588,11 @@ impl LogStoreBufferReceiver {
         reported_error_rows: Vec<ReportedSinkErrorRow>,
     ) {
         let mut inner = self.buffer.inner();
+        let mut merged_error_rows = inner.take_pending_truncate_rows(epoch);
+        merged_error_rows.extend(reported_error_rows);
         inner.add_truncate_offset(ReaderTruncationProgress {
             offset: (epoch, None),
-            reported_error_rows,
+            reported_error_rows: merged_error_rows,
         });
         self.truncate_notify.notify_waiters();
     }
@@ -559,6 +614,7 @@ pub(crate) fn new_log_store_buffer(
         max_row_count,
         chunk_size,
         truncation_list: VecDeque::new(),
+        pending_truncation_list: VecDeque::new(),
         next_chunk_id: 0,
         metrics,
     });

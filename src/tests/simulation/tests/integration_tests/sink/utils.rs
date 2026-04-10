@@ -716,14 +716,20 @@ impl SimulationTestSink {
                                                 reported_error_rows,
                                             )?;
                                         }
-                                        LogStoreReadItem::Barrier { is_checkpoint, .. } => {
+                                        LogStoreReadItem::Barrier {
+                                            is_checkpoint,
+                                            schema_change,
+                                            ..
+                                        } => {
                                             if is_checkpoint {
                                                 store.inc_checkpoint();
                                             }
-                                            log_reader.truncate(
-                                                TruncateOffset::Barrier { epoch },
-                                                vec![],
-                                            )?;
+                                            if schema_change.is_some() {
+                                                log_reader.truncate(
+                                                    TruncateOffset::Barrier { epoch },
+                                                    vec![],
+                                                )?;
+                                            }
                                         }
                                     }
                                 }

@@ -20,6 +20,7 @@ use risingwave_common::bail;
 use risingwave_common::catalog::{ColumnCatalog, Schema};
 use risingwave_common::secret::LocalSecretManager;
 use risingwave_common::types::DataType;
+use risingwave_common::util::value_encoding::column_aware_row_encoding::ColumnAwareSerde;
 use risingwave_connector::match_sink_name_str;
 use risingwave_connector::sink::catalog::{SinkFormat, SinkFormatDesc, SinkId, SinkType};
 use risingwave_connector::sink::file_sink::fs::FsSink;
@@ -265,19 +266,20 @@ impl ExecutorBuilder for SinkExecutorBuilder {
             "sink[{}]-[{}]-executor[{}]",
             connector, sink_id, params.executor_id
         );
-        let error_table = node.error_table.as_ref().map(|table| {
-            StateTableBuilder::new(
-                table,
-                state_store.clone(),
-                params.vnode_bitmap.clone().map(Arc::new),
-            )
-            .with_op_consistency_level(
-                crate::common::table::state_table::StateTableOpConsistencyLevel::Inconsistent,
-            )
-            .forbid_preload_all_rows()
-        });
-        let error_table = match error_table {
-            Some(builder) => Some(builder.build().await),
+        let error_table = match node.error_table.as_ref() {
+            Some(table) => Some(
+                StateTableBuilder::<_, ColumnAwareSerde, false, ()>::new(
+                    table,
+                    state_store.clone(),
+                    params.vnode_bitmap.clone().map(Arc::new),
+                )
+                .with_op_consistency_level(
+                    crate::common::table::state_table::StateTableOpConsistencyLevel::Inconsistent,
+                )
+                .forbid_preload_all_rows()
+                .build()
+                .await,
+            ),
             None => None,
         };
 

@@ -758,10 +758,6 @@ pub trait Sink: TryFrom<SinkParam, Error = SinkError> {
         false
     }
 
-    fn support_skip_error(&self) -> bool {
-        false
-    }
-
     fn validate_alter_config(_config: &BTreeMap<String, String>) -> Result<()> {
         Ok(())
     }
@@ -933,10 +929,6 @@ impl SinkImpl {
 
     pub fn is_coordinated_sink(&self) -> bool {
         dispatch_sink!(self, sink, sink.is_coordinated_sink())
-    }
-
-    pub fn support_skip_error(&self) -> bool {
-        dispatch_sink!(self, sink, sink.support_skip_error())
     }
 }
 
