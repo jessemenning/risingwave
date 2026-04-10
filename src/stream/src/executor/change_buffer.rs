@@ -322,8 +322,13 @@ impl<L: LocalStateStore> ChangeBufferStateWriter<L> {
                 self.current_epoch
             )));
         }
-        self.local_state_store
-            .seal_current_epoch(next_epoch, SealCurrentEpochOptions::for_test());
+        self.local_state_store.seal_current_epoch(
+            next_epoch,
+            SealCurrentEpochOptions {
+                table_watermarks: None,
+                switch_op_consistency_level: None,
+            },
+        );
         self.current_epoch = next_epoch;
         self.dirty = false;
         Ok(())
