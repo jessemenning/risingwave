@@ -122,6 +122,8 @@ pub fn extract_timestamp_from_meta(meta: &SourceMeta) -> DatumRef<'_> {
         SourceMeta::Kafka(kafka_meta) => kafka_meta.extract_timestamp(),
         SourceMeta::DebeziumCdc(cdc_meta) => cdc_meta.extract_timestamp(),
         SourceMeta::Kinesis(kinesis_meta) => kinesis_meta.extract_timestamp(),
+        #[cfg(feature = "source-solace")]
+        SourceMeta::Solace(solace_meta) => solace_meta.extract_sender_timestamp(),
         _ => None,
     }
 }
@@ -174,6 +176,77 @@ pub fn extract_header_inner_from_meta<'a>(
 pub fn extract_subject_from_meta(meta: &SourceMeta) -> Option<DatumRef<'_>> {
     match meta {
         SourceMeta::Nats(nats_meta) => Some(nats_meta.extract_subject()),
+        // Solace's `destination` column reuses the Subject AdditionalColumn type.
+        #[cfg(feature = "source-solace")]
+        SourceMeta::Solace(solace_meta) => Some(solace_meta.extract_destination()),
+        _ => None,
+    }
+}
+
+pub fn extract_solace_replication_group_message_id_from_meta(
+    meta: &SourceMeta,
+) -> Option<DatumRef<'_>> {
+    match meta {
+        #[cfg(feature = "source-solace")]
+        SourceMeta::Solace(m) => Some(m.extract_replication_group_message_id()),
+        _ => None,
+    }
+}
+
+pub fn extract_solace_correlation_id_from_meta(meta: &SourceMeta) -> Option<DatumRef<'_>> {
+    match meta {
+        #[cfg(feature = "source-solace")]
+        SourceMeta::Solace(m) => Some(m.extract_correlation_id()),
+        _ => None,
+    }
+}
+
+pub fn extract_solace_sequence_number_from_meta(meta: &SourceMeta) -> Option<DatumRef<'_>> {
+    match meta {
+        #[cfg(feature = "source-solace")]
+        SourceMeta::Solace(m) => Some(m.extract_sequence_number()),
+        _ => None,
+    }
+}
+
+pub fn extract_solace_priority_from_meta(meta: &SourceMeta) -> Option<DatumRef<'_>> {
+    match meta {
+        #[cfg(feature = "source-solace")]
+        SourceMeta::Solace(m) => Some(m.extract_priority()),
+        _ => None,
+    }
+}
+
+pub fn extract_solace_redelivered_from_meta(meta: &SourceMeta) -> Option<DatumRef<'_>> {
+    match meta {
+        #[cfg(feature = "source-solace")]
+        SourceMeta::Solace(m) => Some(Some(m.extract_redelivered())),
+        _ => None,
+    }
+}
+
+pub fn extract_solace_application_message_id_from_meta(
+    meta: &SourceMeta,
+) -> Option<DatumRef<'_>> {
+    match meta {
+        #[cfg(feature = "source-solace")]
+        SourceMeta::Solace(m) => Some(m.extract_application_message_id()),
+        _ => None,
+    }
+}
+
+pub fn extract_solace_expiration_from_meta(meta: &SourceMeta) -> Option<DatumRef<'_>> {
+    match meta {
+        #[cfg(feature = "source-solace")]
+        SourceMeta::Solace(m) => Some(m.extract_expiration()),
+        _ => None,
+    }
+}
+
+pub fn extract_solace_reply_to_from_meta(meta: &SourceMeta) -> Option<DatumRef<'_>> {
+    match meta {
+        #[cfg(feature = "source-solace")]
+        SourceMeta::Solace(m) => Some(m.extract_reply_to()),
         _ => None,
     }
 }

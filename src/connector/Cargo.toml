@@ -20,8 +20,9 @@ all-sinks = [
     "sink-doris",
     "sink-starrocks",
 ]
-all-sources = ["source-adbc_snowflake"]
+all-sources = ["source-adbc_snowflake", "source-solace"]
 source-adbc_snowflake = ["dep:adbc_core", "dep:adbc_snowflake"]
+source-solace = ["dep:solace-rs"]
 sink-bigquery = [
     "dep:gcp-bigquery-client",
     "dep:google-cloud-bigquery",
@@ -156,6 +157,7 @@ risingwave_jni_core = { workspace = true }
 risingwave_pb = { workspace = true }
 risingwave_rpc_client = { workspace = true }
 rumqttc = { version = "0.25.0", features = ["url"] }
+solace-rs = { path = "../../solace-rs", features = ["async"], optional = true }
 rust_decimal = "1"
 rustls-native-certs = "0.8"
 rustls-pki-types = { version = "1", features = ["std"] }

@@ -24,14 +24,17 @@ use risingwave_pb::plan_common::{
     AdditionalColumnHeaders, AdditionalColumnKey, AdditionalColumnOffset,
     AdditionalColumnPartition, AdditionalColumnPayload, AdditionalColumnPulsarMessageIdData,
     AdditionalColumnTimestamp, AdditionalDatabaseName, AdditionalSchemaName, AdditionalSubject,
-    AdditionalTableName,
+    AdditionalTableName, AdditionalSolaceApplicationMessageId, AdditionalSolaceCorrelationId,
+    AdditionalSolaceExpiration, AdditionalSolacePriority, AdditionalSolaceRedelivered,
+    AdditionalSolaceReplicationGroupMessageId, AdditionalSolaceReplyTo,
+    AdditionalSolaceSequenceNumber,
 };
 
 use crate::error::ConnectorResult;
 use crate::source::cdc::MONGODB_CDC_CONNECTOR;
 use crate::source::{
     AZBLOB_CONNECTOR, GCS_CONNECTOR, KAFKA_CONNECTOR, KINESIS_CONNECTOR, MQTT_CONNECTOR,
-    NATS_CONNECTOR, OPENDAL_S3_CONNECTOR, POSIX_FS_CONNECTOR, PULSAR_CONNECTOR,
+    NATS_CONNECTOR, OPENDAL_S3_CONNECTOR, POSIX_FS_CONNECTOR, PULSAR_CONNECTOR, SOLACE_CONNECTOR,
 };
 
 // Hidden additional columns connectors which do not support `include` syntax.
@@ -89,6 +92,24 @@ pub static COMPATIBLE_ADDITIONAL_COLUMNS: LazyLock<HashMap<&'static str, HashSet
                 ]),
             ),
             (MQTT_CONNECTOR, HashSet::from(["offset", "partition"])),
+            (
+                SOLACE_CONNECTOR,
+                HashSet::from([
+                    "timestamp",
+                    "partition",
+                    "offset",
+                    "payload",
+                    "destination",
+                    "replication_group_message_id",
+                    "correlation_id",
+                    "sequence_number",
+                    "priority",
+                    "redelivered",
+                    "application_message_id",
+                    "expiration",
+                    "reply_to",
+                ]),
+            ),
         ])
     });
 
@@ -285,6 +306,95 @@ pub fn build_additional_column_desc(
             AdditionalColumn {
                 column_type: Some(AdditionalColumnType::PulsarMessageIdData(
                     AdditionalColumnPulsarMessageIdData {},
+                )),
+            },
+        ),
+        // Solace destination (the topic or queue the message arrived on)
+        "destination" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Varchar,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::Subject(AdditionalSubject {})),
+            },
+        ),
+        "replication_group_message_id" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Varchar,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::SolaceReplicationGroupMessageId(
+                    AdditionalSolaceReplicationGroupMessageId {},
+                )),
+            },
+        ),
+        "correlation_id" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Varchar,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::SolaceCorrelationId(
+                    AdditionalSolaceCorrelationId {},
+                )),
+            },
+        ),
+        "sequence_number" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Int64,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::SolaceSequenceNumber(
+                    AdditionalSolaceSequenceNumber {},
+                )),
+            },
+        ),
+        "priority" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Int32,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::SolacePriority(
+                    AdditionalSolacePriority {},
+                )),
+            },
+        ),
+        "redelivered" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Boolean,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::SolaceRedelivered(
+                    AdditionalSolaceRedelivered {},
+                )),
+            },
+        ),
+        "application_message_id" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Varchar,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::SolaceApplicationMessageId(
+                    AdditionalSolaceApplicationMessageId {},
+                )),
+            },
+        ),
+        "expiration" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Timestamptz,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::SolaceExpiration(
+                    AdditionalSolaceExpiration {},
+                )),
+            },
+        ),
+        "reply_to" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Varchar,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::SolaceReplyTo(
+                    AdditionalSolaceReplyTo {},
                 )),
             },
         ),

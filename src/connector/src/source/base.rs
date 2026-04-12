@@ -914,6 +914,8 @@ pub enum SourceMeta {
     Datagen(DatagenMeta),
     DebeziumCdc(DebeziumCdcMeta),
     Nats(NatsMeta),
+    #[cfg(feature = "source-solace")]
+    Solace(crate::source::solace::source::message::SolaceMeta),
     // For the source that doesn't have meta data.
     Empty,
 }
@@ -1101,6 +1103,33 @@ mod tests {
             assert_eq!(c.properties.get("table.name").unwrap(), "orders");
         } else {
             panic!("extract cdc config failed");
+        }
+    }
+
+    #[cfg(feature = "source-solace")]
+    #[test]
+    fn test_extract_solace_config() {
+        let props = convert_args!(btreemap!(
+            "connector" => "solace",
+            "solace.url" => "tcp://broker:55555",
+            "solace.vpn_name" => "default",
+            "solace.username" => "admin",
+            "solace.password" => "pass",
+            "solace.queue" => "my-queue",
+            "solace.ack_mode" => "checkpoint",
+        ));
+
+        let props =
+            ConnectorProperties::extract(WithOptionsSecResolved::without_secrets(props), true)
+                .unwrap();
+        if let ConnectorProperties::Solace(s) = props {
+            assert_eq!(s.common.url, "tcp://broker:55555");
+            assert_eq!(s.common.vpn_name, Some("default".to_owned()));
+            assert_eq!(s.common.username, Some("admin".to_owned()));
+            assert_eq!(s.queue, "my-queue");
+            assert_eq!(s.ack_mode, Some("checkpoint".to_owned()));
+        } else {
+            panic!("expected ConnectorProperties::Solace");
         }
     }
 }

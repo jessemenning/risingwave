@@ -23,6 +23,7 @@ pub mod prelude {
     pub use crate::source::kinesis::KinesisSplitEnumerator;
     pub use crate::source::mqtt::MqttSplitEnumerator;
     pub use crate::source::nats::NatsSplitEnumerator;
+    pub use crate::source::solace::SolaceSplitEnumerator;
     pub use crate::source::nexmark::NexmarkSplitEnumerator;
     pub use crate::source::pulsar::PulsarSplitEnumerator;
     pub use crate::source::test_source::TestSourceSplitEnumerator as TestSplitEnumerator;
@@ -75,12 +76,14 @@ pub use nats::NATS_CONNECTOR;
 use utils::feature_gated_source_mod;
 
 pub use self::adbc_snowflake::ADBC_SNOWFLAKE_CONNECTOR;
+pub use self::solace::SOLACE_CONNECTOR;
 mod common;
 pub mod iceberg;
 mod manager;
 pub mod reader;
 pub mod test_source;
 feature_gated_source_mod!(adbc_snowflake, "adbc_snowflake");
+feature_gated_source_mod!(solace, "solace");
 
 use async_nats::jetstream::consumer::AckPolicy as JetStreamAckPolicy;
 use async_nats::jetstream::context::Context as JetStreamContext;
@@ -128,6 +131,11 @@ pub enum WaitCheckpointTask {
     AckPubsubMessage(Subscription, Vec<ArrayRef>),
     AckNatsJetStream(JetStreamContext, Vec<ArrayRef>, JetStreamAckPolicy),
     AckPulsarMessage(Vec<(String, ArrayRef)>),
+    /// Solace guaranteed message ack via channel to the reader's background ack task.
+    /// Stores (ack_channel_id, offset_arrays) — message IDs are sent through the channel
+    /// after checkpoint.
+    #[cfg(feature = "source-solace")]
+    AckSolaceMessage(String, Vec<ArrayRef>),
 }
 
 impl WaitCheckpointTask {
@@ -144,6 +152,10 @@ impl WaitCheckpointTask {
                 WaitCheckpointTask::AckNatsJetStream(context.clone(), vec![], *ack_policy)
             }
             WaitCheckpointTask::AckPulsarMessage(_) => WaitCheckpointTask::AckPulsarMessage(vec![]),
+            #[cfg(feature = "source-solace")]
+            WaitCheckpointTask::AckSolaceMessage(channel_id, _) => {
+                WaitCheckpointTask::AckSolaceMessage(channel_id.clone(), vec![])
+            }
         }
     }
 
@@ -337,6 +349,51 @@ impl WaitCheckpointTask {
                             )
                             .await;
                         }
+                    }
+                }
+            }
+            #[cfg(feature = "source-solace")]
+            WaitCheckpointTask::AckSolaceMessage(ack_channel_id, offset_arrs) => {
+                use crate::source::solace::source::reader::SOLACE_ACK_CHANNEL;
+
+                // Collect message IDs from the offset arrays (stored as UTF-8 strings).
+                let mut msg_ids: Vec<u64> = Vec::new();
+                for arr in &offset_arrs {
+                    for offset_str in arr.as_utf8().iter().flatten() {
+                        if offset_str.is_empty() {
+                            continue;
+                        }
+                        match offset_str.parse::<u64>() {
+                            Ok(id) => msg_ids.push(id),
+                            Err(e) => {
+                                tracing::warn!(
+                                    source_id = source_id_label,
+                                    source_name,
+                                    offset = %offset_str,
+                                    error = %e,
+                                    "failed to parse Solace message ID from offset",
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if !msg_ids.is_empty() {
+                    if let Some(ack_tx) = SOLACE_ACK_CHANNEL.get(&ack_channel_id).await {
+                        if ack_tx.send(msg_ids).is_err() {
+                            tracing::error!(
+                                source_id = source_id_label,
+                                source_name,
+                                "Solace ack channel closed — reader may have been dropped",
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            source_id = source_id_label,
+                            source_name,
+                            channel_id = %ack_channel_id,
+                            "Solace ack channel not found — reader may not have started yet",
+                        );
                     }
                 }
             }

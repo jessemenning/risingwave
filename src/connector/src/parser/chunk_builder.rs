@@ -30,7 +30,11 @@ use thiserror_ext::AsReport;
 use super::MessageMeta;
 use crate::parser::utils::{
     extract_cdc_meta_column, extract_header_inner_from_meta, extract_headers_from_meta,
-    extract_pulsar_message_id_data_from_meta, extract_subject_from_meta,
+    extract_pulsar_message_id_data_from_meta, extract_solace_application_message_id_from_meta,
+    extract_solace_correlation_id_from_meta, extract_solace_expiration_from_meta,
+    extract_solace_priority_from_meta, extract_solace_redelivered_from_meta,
+    extract_solace_replication_group_message_id_from_meta, extract_solace_reply_to_from_meta,
+    extract_solace_sequence_number_from_meta, extract_subject_from_meta,
     extract_timestamp_from_meta,
 };
 use crate::source::{SourceColumnDesc, SourceColumnType, SourceCtrlOpts, SourceMeta};
@@ -429,6 +433,70 @@ impl SourceStreamChunkRowWriter<'_> {
                             .unwrap_or(None),
                     ))
                 }
+                (_, &Some(AdditionalColumnType::SolaceReplicationGroupMessageId(_))) => {
+                    Ok(A::output_for(
+                        self.row_meta
+                            .as_ref()
+                            .and_then(|ele| {
+                                extract_solace_replication_group_message_id_from_meta(
+                                    ele.source_meta,
+                                )
+                            })
+                            .unwrap_or(None),
+                    ))
+                }
+                (_, &Some(AdditionalColumnType::SolaceCorrelationId(_))) => Ok(A::output_for(
+                    self.row_meta
+                        .as_ref()
+                        .and_then(|ele| {
+                            extract_solace_correlation_id_from_meta(ele.source_meta)
+                        })
+                        .unwrap_or(None),
+                )),
+                (_, &Some(AdditionalColumnType::SolaceSequenceNumber(_))) => Ok(A::output_for(
+                    self.row_meta
+                        .as_ref()
+                        .and_then(|ele| {
+                            extract_solace_sequence_number_from_meta(ele.source_meta)
+                        })
+                        .unwrap_or(None),
+                )),
+                (_, &Some(AdditionalColumnType::SolacePriority(_))) => Ok(A::output_for(
+                    self.row_meta
+                        .as_ref()
+                        .and_then(|ele| extract_solace_priority_from_meta(ele.source_meta))
+                        .unwrap_or(None),
+                )),
+                (_, &Some(AdditionalColumnType::SolaceRedelivered(_))) => Ok(A::output_for(
+                    self.row_meta
+                        .as_ref()
+                        .and_then(|ele| {
+                            extract_solace_redelivered_from_meta(ele.source_meta)
+                        })
+                        .unwrap_or(None),
+                )),
+                (_, &Some(AdditionalColumnType::SolaceApplicationMessageId(_))) => {
+                    Ok(A::output_for(
+                        self.row_meta
+                            .as_ref()
+                            .and_then(|ele| {
+                                extract_solace_application_message_id_from_meta(ele.source_meta)
+                            })
+                            .unwrap_or(None),
+                    ))
+                }
+                (_, &Some(AdditionalColumnType::SolaceExpiration(_))) => Ok(A::output_for(
+                    self.row_meta
+                        .as_ref()
+                        .and_then(|ele| extract_solace_expiration_from_meta(ele.source_meta))
+                        .unwrap_or(None),
+                )),
+                (_, &Some(AdditionalColumnType::SolaceReplyTo(_))) => Ok(A::output_for(
+                    self.row_meta
+                        .as_ref()
+                        .and_then(|ele| extract_solace_reply_to_from_meta(ele.source_meta))
+                        .unwrap_or(None),
+                )),
                 (_, &Some(AdditionalColumnType::Filename(_))) => {
                     // Filename is used as partition in FS connectors
                     Ok(A::output_for(

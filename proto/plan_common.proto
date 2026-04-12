@@ -273,6 +273,16 @@ message AdditionalSubject {}
 
 message AdditionalColumnPulsarMessageIdData {}
 
+// Solace-specific additional column types
+message AdditionalSolaceReplicationGroupMessageId {}
+message AdditionalSolaceCorrelationId {}
+message AdditionalSolaceSequenceNumber {}
+message AdditionalSolacePriority {}
+message AdditionalSolaceRedelivered {}
+message AdditionalSolaceApplicationMessageId {}
+message AdditionalSolaceExpiration {}
+message AdditionalSolaceReplyTo {}
+
 message AdditionalColumn {
   oneof column_type {
     AdditionalColumnKey key = 1;
@@ -289,6 +299,14 @@ message AdditionalColumn {
     AdditionalColumnPayload payload = 12;
     AdditionalSubject subject = 13;
     AdditionalColumnPulsarMessageIdData pulsar_message_id_data = 14;
+    AdditionalSolaceReplicationGroupMessageId solace_replication_group_message_id = 15;
+    AdditionalSolaceCorrelationId solace_correlation_id = 16;
+    AdditionalSolaceSequenceNumber solace_sequence_number = 17;
+    AdditionalSolacePriority solace_priority = 18;
+    AdditionalSolaceRedelivered solace_redelivered = 19;
+    AdditionalSolaceApplicationMessageId solace_application_message_id = 20;
+    AdditionalSolaceExpiration solace_expiration = 21;
+    AdditionalSolaceReplyTo solace_reply_to = 22;
   }
 }
 

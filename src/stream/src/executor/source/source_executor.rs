@@ -1191,6 +1191,18 @@ impl WaitCheckpointTaskBuilder {
                 arrays.push((pulsar_ack_channel_id, offset_col));
             }
             WaitCheckpointTask::CommitCdcOffset(_) => {}
+            #[cfg(feature = "source-solace")]
+            WaitCheckpointTask::AckSolaceMessage(channel_id, arrays) => {
+                if channel_id.is_empty() {
+                    // First chunk — populate the channel_id from split state.
+                    let split_id = latest_state.keys().next().unwrap();
+                    *channel_id =
+                        risingwave_connector::source::solace::source::reader::build_solace_ack_channel_id(
+                            source_id, split_id,
+                        );
+                }
+                arrays.push(offset_col);
+            }
         }
     }
 

@@ -17,6 +17,11 @@
 mod mqtt_common;
 pub use mqtt_common::{MqttCommon, QualityOfService as MqttQualityOfService};
 
+#[cfg(feature = "source-solace")]
+mod solace_common;
+#[cfg(feature = "source-solace")]
+pub use solace_common::SolaceCommon;
+
 mod common;
 pub use common::{
     AwsAuthProps, AwsPrivateLinkItem, DISABLE_DEFAULT_CREDENTIAL, KafkaCommon,

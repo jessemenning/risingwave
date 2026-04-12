@@ -141,6 +141,21 @@ impl SourceReader {
                 }
             }
             ConnectorProperties::Pulsar(_) => Some(WaitCheckpointTask::AckPulsarMessage(vec![])),
+            #[cfg(feature = "source-solace")]
+            ConnectorProperties::Solace(prop) => {
+                use crate::source::solace::SolaceAckMode;
+                match SolaceAckMode::from_str_opt(prop.ack_mode.as_deref())? {
+                    SolaceAckMode::Checkpoint => {
+                        // The channel_id will be populated when the reader starts.
+                        // We use a placeholder here; the reader registers the channel.
+                        Some(WaitCheckpointTask::AckSolaceMessage(
+                            String::new(), // populated by update_task_on_chunk
+                            vec![],
+                        ))
+                    }
+                    SolaceAckMode::Immediate => None,
+                }
+            }
             _ => None,
         })
     }

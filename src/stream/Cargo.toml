@@ -10,8 +10,9 @@ repository = { workspace = true }
 [features]
 dhat-heap = ["dhat"]
 test = []
-all-sources = ["source-adbc_snowflake"]
+all-sources = ["source-adbc_snowflake", "source-solace"]
 source-adbc_snowflake = ["risingwave_connector/source-adbc_snowflake"]
+source-solace = ["risingwave_connector/source-solace"]
 
 [dependencies]
 anyhow = "1"

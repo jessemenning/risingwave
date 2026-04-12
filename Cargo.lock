@@ -407,7 +407,7 @@ dependencies = [
  "arrow-data 57.3.0",
  "arrow-schema 57.3.0",
  "chrono",
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -458,7 +458,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "num-complex",
  "num-integer",
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -492,7 +492,7 @@ dependencies = [
  "bytes",
  "half 2.7.1",
  "num-bigint",
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -553,7 +553,7 @@ dependencies = [
  "comfy-table",
  "half 2.7.1",
  "lexical-core",
- "num-traits",
+ "num-traits 0.2.19",
  "ryu",
 ]
 
@@ -606,7 +606,7 @@ dependencies = [
  "arrow-schema 57.3.0",
  "half 2.7.1",
  "num-integer",
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -688,7 +688,7 @@ dependencies = [
  "itoa",
  "lexical-core",
  "memchr",
- "num-traits",
+ "num-traits 0.2.19",
  "ryu",
  "serde_core",
  "serde_json",
@@ -810,7 +810,7 @@ dependencies = [
  "arrow-buffer 57.3.0",
  "arrow-data 57.3.0",
  "arrow-schema 57.3.0",
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -842,7 +842,7 @@ dependencies = [
  "arrow-schema 57.3.0",
  "arrow-select 57.3.0",
  "memchr",
- "num-traits",
+ "num-traits 0.2.19",
  "regex",
  "regex-syntax",
 ]
@@ -896,7 +896,7 @@ dependencies = [
  "asn1-rs-impl",
  "displaydoc",
  "nom",
- "num-traits",
+ "num-traits 0.2.19",
  "rusticata-macros",
  "thiserror 2.0.17",
  "time",
@@ -1123,7 +1123,7 @@ version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f28d99ec8bfea296261ca1af174f24225171fea9664ba9003cbebee704810528"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -1286,7 +1286,7 @@ version = "0.13.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8bce4948d2520386c6d92a6ea2d472300257702242e5a1d01d6add52bd2e7c1"
 dependencies = [
- "bindgen",
+ "bindgen 0.72.1",
  "cc",
  "cmake",
  "dunce",
@@ -2097,7 +2097,7 @@ checksum = "a6773ddc0eafc0e509fb60e48dff7f450f8e674a0686ae8605e8d9901bd5eefa"
 dependencies = [
  "num-bigint",
  "num-integer",
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -2110,7 +2110,7 @@ dependencies = [
  "libm",
  "num-bigint",
  "num-integer",
- "num-traits",
+ "num-traits 0.2.19",
  "serde",
 ]
 
@@ -2147,6 +2147,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf95709a440f45e986983918d0e8a1f30a9b1df04918fc828670606804ac3c09"
 dependencies = [
  "virtue",
+]
+
+[[package]]
+name = "bindgen"
+version = "0.66.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2b84e06fc203107bfbad243f4aba2af864eb7db3b1cf46ea0a023b0b433d2a7"
+dependencies = [
+ "bitflags 2.10.0",
+ "cexpr",
+ "clang-sys",
+ "lazy_static",
+ "lazycell",
+ "log",
+ "peeking_take_while",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 1.1.0",
+ "shlex",
+ "syn 2.0.117",
+ "which",
 ]
 
 [[package]]
@@ -2389,7 +2412,7 @@ version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9dd6407f73a9b8b6162d8a2ef999fe6afd7cc15902ebf42c5cd296addf17e0ad"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -2604,7 +2627,7 @@ checksum = "145052bdd345b87320e369255277e3fb5152762ad123a901ef5c262dd38fe8d2"
 dependencies = [
  "iana-time-zone",
  "js-sys",
- "num-traits",
+ "num-traits 0.2.19",
  "serde",
  "wasm-bindgen",
  "windows-link 0.2.1",
@@ -3256,7 +3279,7 @@ dependencies = [
  "criterion-plot",
  "futures",
  "itertools 0.13.0",
- "num-traits",
+ "num-traits 0.2.19",
  "oorandom",
  "page_size",
  "plotters",
@@ -4021,7 +4044,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "md-5",
- "num-traits",
+ "num-traits 0.2.19",
  "rand 0.9.2",
  "regex",
  "sha2",
@@ -4545,7 +4568,7 @@ dependencies = [
  "displaydoc",
  "nom",
  "num-bigint",
- "num-traits",
+ "num-traits 0.2.19",
  "rusticata-macros",
 ]
 
@@ -5115,6 +5138,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "enum_primitive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be4551092f4d519593039259a9ed8daedf0da12e5109c5280338073eaeb81180"
+dependencies = [
+ "num-traits 0.1.43",
+]
+
+[[package]]
 name = "enumflags2"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5339,7 +5371,7 @@ checksum = "4089ab2dfd45d8ddc92febb5ca80644389d5ebb954f40231274a3f18341762e2"
 dependencies = [
  "bnum",
  "num-integer",
- "num-traits",
+ "num-traits 0.2.19",
  "serde",
 ]
 
@@ -5427,6 +5459,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0870c84016d4b481be5c9f323c24f65e31e901ae618f0e80f4308fb00de1d2d"
 
 [[package]]
+name = "filetime"
+version = "0.2.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f98844151eee8917efc50bd9e8318cb963ae8b297431495d3f758616ea5c57db"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "libredox 0.1.3",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5510,7 +5553,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -5519,7 +5562,7 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b09cf3155332e944990140d967ff5eceb70df778b34f77d8075db46e4704e6d8"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -6324,7 +6367,7 @@ checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
  "cfg-if",
  "crunchy",
- "num-traits",
+ "num-traits 0.2.19",
  "zerocopy 0.8.28",
 ]
 
@@ -6414,7 +6457,7 @@ dependencies = [
  "byteorder",
  "flate2",
  "nom",
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -6816,7 +6859,7 @@ checksum = "1d7ee43a7d27a202506374a5afb36b89c3be719ace2082e492dabb2034028124"
 dependencies = [
  "atomic",
  "crossbeam-utils",
- "num-traits",
+ "num-traits 0.2.19",
  "rayon",
  "thread_local",
 ]
@@ -7530,6 +7573,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazycell"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
+
+[[package]]
 name = "lber"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7717,6 +7766,7 @@ checksum = "c0ff37bd590ca25063e35af745c343cb7a0271906fb7b37e4813e8f79f00268d"
 dependencies = [
  "bitflags 2.10.0",
  "libc",
+ "redox_syscall 0.5.7",
 ]
 
 [[package]]
@@ -8561,7 +8611,7 @@ dependencies = [
  "getrandom 0.3.1",
  "mysql-common-derive",
  "num-bigint",
- "num-traits",
+ "num-traits 0.2.19",
  "regex",
  "rust_decimal",
  "saturating",
@@ -8748,7 +8798,7 @@ dependencies = [
  "num-integer",
  "num-iter",
  "num-rational",
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -8758,7 +8808,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
 dependencies = [
  "num-integer",
- "num-traits",
+ "num-traits 0.2.19",
  "serde",
 ]
 
@@ -8772,7 +8822,7 @@ dependencies = [
  "libm",
  "num-integer",
  "num-iter",
- "num-traits",
+ "num-traits 0.2.19",
  "rand 0.8.5",
  "smallvec",
  "zeroize",
@@ -8784,7 +8834,7 @@ version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -8809,7 +8859,7 @@ version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -8820,7 +8870,7 @@ checksum = "7d03e6c028c5dc5cac6e2dec0efda81fc887605bb3d884578bb6d6bf7514e252"
 dependencies = [
  "autocfg",
  "num-integer",
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -8832,7 +8882,16 @@ dependencies = [
  "autocfg",
  "num-bigint",
  "num-integer",
- "num-traits",
+ "num-traits 0.2.19",
+]
+
+[[package]]
+name = "num-traits"
+version = "0.1.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92e5113e9fd4cc14ded8e499429f396a20f98c772a47cc8622a736e1ec843c31"
+dependencies = [
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -9251,7 +9310,7 @@ version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7940cf2ca942593318d07fcf2596cdca60a85c9e7fab408a5e21a4f9dcd40d87"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -9260,7 +9319,7 @@ version = "3.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a54938017eacd63036332b4ae5c8a49fc8c0c1d6d629893057e4f13609edd06"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -9269,7 +9328,7 @@ version = "4.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "536900a8093134cf9ccf00a27deb3532421099e958d9dd431135d0c7543ca1e8"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -9517,7 +9576,7 @@ dependencies = [
  "lz4_flex 0.12.1",
  "num-bigint",
  "num-integer",
- "num-traits",
+ "num-traits 0.2.19",
  "object_store",
  "paste",
  "seq-macro",
@@ -9627,6 +9686,12 @@ dependencies = [
  "smallvec",
  "tokio",
 ]
+
+[[package]]
+name = "peeking_take_while"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19b17cddbe7ec3f8bc800887bab5e717348c95ea2ca0b1bf0837fb964dc67099"
 
 [[package]]
 name = "pem"
@@ -9952,7 +10017,7 @@ version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2c224ba00d7cadd4d5c660deaf2098e5e80e07846537c51f9cfa4be50c1fd45"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
  "plotters-backend",
  "plotters-svg",
  "wasm-bindgen",
@@ -11630,7 +11695,7 @@ dependencies = [
  "memcomparable",
  "more-asserts",
  "num-integer",
- "num-traits",
+ "num-traits 0.2.19",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot 0.12.5",
@@ -12046,6 +12111,7 @@ dependencies = [
  "serde_yaml",
  "simd-json",
  "smallvec",
+ "solace-rs",
  "sqlx",
  "strum 0.28.0",
  "strum_macros 0.28.0",
@@ -12218,7 +12284,7 @@ dependencies = [
  "itertools 0.14.0",
  "linkme",
  "madsim-tokio",
- "num-traits",
+ "num-traits 0.2.19",
  "parse-display",
  "paste",
  "prometheus",
@@ -12268,7 +12334,7 @@ dependencies = [
  "madsim-tokio",
  "md-5",
  "moka",
- "num-traits",
+ "num-traits 0.2.19",
  "openssl",
  "rand 0.9.2",
  "regex",
@@ -13313,7 +13379,7 @@ dependencies = [
  "digest",
  "num-bigint-dig",
  "num-integer",
- "num-traits",
+ "num-traits 0.2.19",
  "pkcs1",
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
@@ -13408,7 +13474,7 @@ dependencies = [
  "arrayvec",
  "borsh",
  "bytes",
- "num-traits",
+ "num-traits 0.2.19",
  "postgres-types",
  "rand 0.8.5",
  "rkyv",
@@ -14536,7 +14602,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adc4e5204eb1910f40f9cfa375f6f05b68c3abac4b6fd879c8ff5e7ae8a0a085"
 dependencies = [
  "num-bigint",
- "num-traits",
+ "num-traits 0.2.19",
  "thiserror 1.0.63",
  "time",
 ]
@@ -14596,7 +14662,7 @@ version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0b6c16e2970706b96c16d72f6d835d4758ddb2a0c471c9a7de8be4b1dde049b"
 dependencies = [
- "num-traits",
+ "num-traits 0.2.19",
 ]
 
 [[package]]
@@ -14642,6 +14708,33 @@ checksum = "233504af464074f9d066d7b5416c5f9b894a5862a6506e306f7b816cdd6f1807"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "solace-rs"
+version = "0.9.0"
+dependencies = [
+ "enum_primitive",
+ "futures-core",
+ "num-traits 0.2.19",
+ "solace-rs-sys",
+ "thiserror 1.0.63",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "solace-rs-sys"
+version = "1.1.0"
+dependencies = [
+ "bindgen 0.66.1",
+ "cfg-if",
+ "flate2",
+ "rustls 0.23.35",
+ "rustls-native-certs 0.8.1",
+ "tar",
+ "ureq",
 ]
 
 [[package]]
@@ -15316,6 +15409,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
+name = "tar"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22692a6476a21fa75fdfc11d452fda482af402c008cdbaf3476414e122040973"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
+
+[[package]]
 name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15467,7 +15571,7 @@ dependencies = [
  "encoding_rs",
  "enumflags2",
  "futures-util",
- "num-traits",
+ "num-traits 0.2.19",
  "once_cell",
  "pin-project-lite",
  "pretty-hex",
@@ -16494,6 +16598,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
+name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64 0.22.1",
+ "flate2",
+ "log",
+ "once_cell",
+ "rustls 0.23.35",
+ "rustls-pki-types",
+ "url",
+ "webpki-roots 0.26.1",
+]
+
+[[package]]
 name = "url"
 version = "2.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17155,6 +17275,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2878ef029c47c6e8cf779119f20fcf52bde7ad42a731b2a304bc221df17571e"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "which"
+version = "4.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87ba24419a2078cd2b0f2ede2691b6c66d8e47836da3b6db8265ebad47afbfc7"
+dependencies = [
+ "either",
+ "home",
+ "once_cell",
+ "rustix 0.38.41",
 ]
 
 [[package]]
@@ -17926,6 +18058,16 @@ dependencies = [
  "rusticata-macros",
  "thiserror 2.0.17",
  "time",
+]
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix 1.1.3",
 ]
 
 [[package]]
