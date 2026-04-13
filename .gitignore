@@ -96,3 +96,4 @@ book/
 # Build caches
 .m2/
 solace-rs/
+solace-risingwave-backfill-prompt_1.md
