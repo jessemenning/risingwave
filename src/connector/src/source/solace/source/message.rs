@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
+
 use risingwave_common::types::{ScalarRefImpl, Timestamptz};
 use solace_rs::message::{InboundMessage, Message};
 
@@ -107,6 +109,21 @@ pub struct SolaceMessage {
     pub application_message_id: Option<String>,
     pub expiration: Option<Timestamptz>,
     pub reply_to: Option<String>,
+    /// User properties extracted from the Solace message.
+    /// Used for sentinel detection (key: `x-solace-sentinel`).
+    pub user_properties: HashMap<String, String>,
+}
+
+impl SolaceMessage {
+    /// Returns `true` if this message carries the backfill sentinel user property
+    /// (`x-solace-sentinel = backfill-complete`). Sentinel messages should be
+    /// intercepted by the reader and never yielded to the source table.
+    pub fn is_sentinel(&self) -> bool {
+        self.user_properties
+            .get("x-solace-sentinel")
+            .map(|v| v == "backfill-complete")
+            .unwrap_or(false)
+    }
 }
 
 impl SolaceMessage {
@@ -196,6 +213,10 @@ impl SolaceMessage {
             .flatten()
             .map(|d| d.dest.to_string_lossy().into_owned());
 
+        let user_properties = msg
+            .get_user_properties()
+            .unwrap_or_default();
+
         Self {
             split_id,
             msg_id,
@@ -210,6 +231,7 @@ impl SolaceMessage {
             application_message_id,
             expiration,
             reply_to,
+            user_properties,
         }
     }
 }
@@ -259,6 +281,7 @@ mod test {
             application_message_id: None,
             expiration: None,
             reply_to: None,
+            user_properties: HashMap::new(),
         }
     }
 
@@ -282,8 +305,10 @@ mod test {
     }
 
     #[test]
-    fn test_solace_message_to_source_message_empty() {
-        let msg = make_msg(None);
+    fn test_solace_message_to_source_message_no_destination() {
+        let mut msg = make_msg(None);
+        msg.payload = vec![];
+        msg.msg_id = String::new();
         let source_msg = SourceMessage::from(msg);
 
         assert_eq!(source_msg.payload, Some(vec![]));
@@ -312,6 +337,7 @@ mod test {
             application_message_id: None,
             expiration: None,
             reply_to: None,
+            user_properties: HashMap::new(),
         };
 
         let source_msg = SourceMessage::from(msg);
@@ -342,6 +368,7 @@ mod test {
             application_message_id: Some("app-msg-1".to_owned()),
             expiration: Some(ts),
             reply_to: Some("reply/topic".to_owned()),
+            user_properties: HashMap::new(),
         };
 
         let source_msg = SourceMessage::from(msg);
@@ -366,5 +393,58 @@ mod test {
             }
             other => panic!("expected SourceMeta::Solace, got {:?}", other),
         }
+    }
+
+    // ── Sentinel detection tests ────────────────────────────────────────
+
+    #[test]
+    fn test_is_sentinel_with_valid_property() {
+        let mut msg = make_msg(Some("fleet/system/sentinel"));
+        msg.user_properties.insert(
+            "x-solace-sentinel".to_owned(),
+            "backfill-complete".to_owned(),
+        );
+        assert!(msg.is_sentinel());
+    }
+
+    #[test]
+    fn test_is_sentinel_with_wrong_value() {
+        let mut msg = make_msg(Some("fleet/system/sentinel"));
+        msg.user_properties.insert(
+            "x-solace-sentinel".to_owned(),
+            "something-else".to_owned(),
+        );
+        assert!(!msg.is_sentinel());
+    }
+
+    #[test]
+    fn test_is_sentinel_with_no_properties() {
+        let msg = make_msg(Some("fleet/telemetry/vehicle_001/metrics"));
+        assert!(msg.user_properties.is_empty());
+        assert!(!msg.is_sentinel());
+    }
+
+    #[test]
+    fn test_is_sentinel_with_other_properties() {
+        let mut msg = make_msg(Some("fleet/telemetry/vehicle_001/metrics"));
+        msg.user_properties.insert(
+            "x-custom-header".to_owned(),
+            "some-value".to_owned(),
+        );
+        assert!(!msg.is_sentinel());
+    }
+
+    #[test]
+    fn test_sentinel_has_payload_but_is_still_sentinel() {
+        // Sentinel messages carry a payload (informational), but the sentinel
+        // identity comes from the user property, not the payload content.
+        let mut msg = make_msg(Some("fleet/system/sentinel"));
+        msg.payload = b"{\"message\":\"backfill boundary marker\"}".to_vec();
+        msg.user_properties.insert(
+            "x-solace-sentinel".to_owned(),
+            "backfill-complete".to_owned(),
+        );
+        assert!(msg.is_sentinel());
+        assert!(!msg.payload.is_empty());
     }
 }

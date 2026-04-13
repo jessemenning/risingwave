@@ -27,6 +27,13 @@ pub struct SolaceSplit {
     pub(crate) split_id: SplitId,
     /// Last seen message ID, used for offset tracking.
     pub(crate) start_offset: Option<String>,
+    /// Whether the backfill sentinel was detected. When `true`, the connector
+    /// is in live mode and will re-publish the readiness event on restart.
+    #[serde(default)]
+    pub(crate) sentinel_detected: bool,
+    /// ISO 8601 timestamp of when the sentinel was first detected.
+    #[serde(default)]
+    pub(crate) sentinel_detected_at: Option<String>,
 }
 
 impl SplitMetaData for SolaceSplit {
@@ -54,6 +61,8 @@ impl SolaceSplit {
             queue_name,
             split_id,
             start_offset: None,
+            sentinel_detected: false,
+            sentinel_detected_at: None,
         }
     }
 }
@@ -99,5 +108,48 @@ mod test {
 
         split.update_offset("100000".to_owned()).unwrap();
         assert_eq!(split.start_offset, Some("100000".to_owned()));
+    }
+
+    #[test]
+    fn test_split_sentinel_false_by_default() {
+        let split = SolaceSplit::new("q".to_owned(), Arc::from("0"));
+        assert!(!split.sentinel_detected);
+        assert_eq!(split.sentinel_detected_at, None);
+    }
+
+    #[test]
+    fn test_split_encode_decode_with_sentinel() {
+        let split = SolaceSplit {
+            queue_name: "rw-ingest".to_owned(),
+            split_id: Arc::from("0"),
+            start_offset: Some("42".to_owned()),
+            sentinel_detected: true,
+            sentinel_detected_at: Some("2026-04-13T12:00:00Z".to_owned()),
+        };
+
+        let encoded = split.encode_to_json();
+        let decoded = SolaceSplit::restore_from_json(encoded).unwrap();
+        assert_eq!(split, decoded);
+        assert!(decoded.sentinel_detected);
+        assert_eq!(
+            decoded.sentinel_detected_at,
+            Some("2026-04-13T12:00:00Z".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_split_backward_compat_no_sentinel_fields() {
+        // Simulate an OLD checkpoint that was serialized before sentinel fields existed.
+        let old_json = serde_json::json!({
+            "queue_name": "legacy-queue",
+            "split_id": "0",
+            "start_offset": "999"
+        });
+        let split: SolaceSplit = serde_json::from_value(old_json).unwrap();
+        assert_eq!(split.queue_name, "legacy-queue");
+        assert_eq!(split.start_offset, Some("999".to_owned()));
+        // Sentinel fields default to false / None thanks to #[serde(default)]
+        assert!(!split.sentinel_detected);
+        assert_eq!(split.sentinel_detected_at, None);
     }
 }

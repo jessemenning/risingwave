@@ -72,6 +72,13 @@ pub struct SolaceProperties {
     #[serde(rename = "solace.ack_mode")]
     pub ack_mode: Option<String>,
 
+    /// Topic prefix for the readiness event published after sentinel detection.
+    /// The connector appends `/{queue_name}/ready` to form the full topic.
+    /// When unset, no readiness event is published (sentinel is still detected
+    /// and intercepted, but no outbound notification is sent).
+    #[serde(rename = "solace.sentinel_readiness_topic")]
+    pub sentinel_readiness_topic: Option<String>,
+
     #[serde(flatten)]
     pub unknown_fields: HashMap<String, String>,
 }
@@ -182,6 +189,34 @@ mod test {
     fn test_parse_solace_ack_mode_invalid() {
         let result = SolaceAckMode::from_str_opt(Some("bogus"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_sentinel_readiness_topic() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "solace.url".to_owned() => "tcp://localhost:55555".to_owned(),
+            "solace.queue".to_owned() => "test-queue".to_owned(),
+            "solace.sentinel_readiness_topic".to_owned() => "system/risingwave/connector".to_owned(),
+        };
+
+        let props: SolaceProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(
+            props.sentinel_readiness_topic,
+            Some("system/risingwave/connector".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_parse_no_sentinel_readiness_topic() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "solace.url".to_owned() => "tcp://localhost:55555".to_owned(),
+            "solace.queue".to_owned() => "test-queue".to_owned(),
+        };
+
+        let props: SolaceProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(props.sentinel_readiness_topic, None);
     }
 
     #[test]
