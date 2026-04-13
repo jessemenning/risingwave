@@ -118,11 +118,21 @@ impl SolaceMessage {
             .map(|id| id.to_string())
             .unwrap_or_default();
 
+        // Try the string variant first so the Solace C SDK strips the SDT
+        // container header that the Python Messaging API adds to string
+        // payloads.  Fall back to the raw binary getter for non-string
+        // attachments (e.g. Bytes payloads published from other clients).
         let payload = msg
-            .get_payload()
+            .get_payload_as_string()
             .ok()
             .flatten()
-            .map(|p| p.to_vec())
+            .map(|s| s.as_bytes().to_vec())
+            .or_else(|| {
+                msg.get_payload()
+                    .ok()
+                    .flatten()
+                    .map(|p| p.to_vec())
+            })
             .unwrap_or_default();
 
         let destination = msg
@@ -131,16 +141,21 @@ impl SolaceMessage {
             .flatten()
             .map(|d| d.dest.to_string_lossy().into_owned());
 
+        // Use sender timestamp if present; fall back to the broker receive
+        // timestamp; finally use SystemTime::now() so the column is never NULL.
+        // (The Python Messaging API does not expose a sender-timestamp setter,
+        // and solClient_msg_getRcvTimestamp returns NotFound for guaranteed
+        // queue messages on some broker versions.)
         let sender_timestamp = msg
             .get_sender_timestamp()
             .ok()
             .flatten()
-            .and_then(|st| {
-                st.duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| d.as_millis() as i64)
-            })
-            .and_then(|ms| Timestamptz::from_millis(ms));
+            .or_else(|| msg.get_rcv_timestamp().ok().flatten())
+            .unwrap_or_else(std::time::SystemTime::now)
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_millis() as i64)
+            .and_then(Timestamptz::from_millis);
 
         let replication_group_message_id =
             msg.get_replication_group_message_id().ok().flatten();

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_connector::source::{ADBC_SNOWFLAKE_CONNECTOR, BATCH_POSIX_FS_CONNECTOR};
+use risingwave_connector::source::{ADBC_SNOWFLAKE_CONNECTOR, BATCH_POSIX_FS_CONNECTOR, SOLACE_CONNECTOR};
 
 use super::*;
 
@@ -118,6 +118,9 @@ static CONNECTORS_COMPATIBLE_FORMATS: LazyLock<HashMap<String, HashMap<Format, V
                 ),
                 ADBC_SNOWFLAKE_CONNECTOR => hashmap!(
                     Format::None => vec![Encode::None],
+                ),
+                SOLACE_CONNECTOR => hashmap!(
+                    Format::Plain => vec![Encode::Json, Encode::Bytes],
                 ),
                 SQL_SERVER_CDC_CONNECTOR => hashmap!(
                     Format::Debezium => vec![Encode::Json],
