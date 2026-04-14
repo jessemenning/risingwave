@@ -21,6 +21,7 @@ pub use split::SolaceSplit;
 use std::collections::HashMap;
 
 use serde::Deserialize;
+use serde_with::{DisplayFromStr, serde_as};
 use with_options::WithOptions;
 
 use crate::connector_common::SolaceCommon;
@@ -58,6 +59,7 @@ impl SolaceAckMode {
     }
 }
 
+#[serde_as]
 #[derive(Clone, Debug, Deserialize, WithOptions)]
 pub struct SolaceProperties {
     #[serde(flatten)]
@@ -79,8 +81,40 @@ pub struct SolaceProperties {
     #[serde(rename = "solace.sentinel_readiness_topic")]
     pub sentinel_readiness_topic: Option<String>,
 
+    /// RisingWave Postgres DSN used for connector-status writes and barrier flush.
+    /// Defaults to `host=localhost port=4566 user=root dbname=dev connect_timeout=5`.
+    #[serde(rename = "solace.risingwave_dsn")]
+    pub risingwave_dsn: Option<String>,
+
+    /// Maximum number of messages to batch per yield.
+    /// Defaults to 100. Higher values increase throughput at the cost of latency.
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(rename = "solace.batch_size")]
+    pub batch_size: Option<usize>,
+
+    /// Number of parallel consumers (RisingWave splits) binding to the queue.
+    /// Each consumer gets its own Solace flow and is assigned work by the broker's
+    /// built-in load balancer. Defaults to 1.
+    ///
+    /// **Limitation:** sentinel-based backfill detection is automatically disabled
+    /// when this value is greater than 1, because a single sentinel message is
+    /// consumed by only one of the N readers. See PARALLEL_CONSUMERS.md for
+    /// the Option A roadmap to lift this restriction.
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(rename = "solace.num_consumers")]
+    pub num_consumers: Option<usize>,
+
     #[serde(flatten)]
     pub unknown_fields: HashMap<String, String>,
+}
+
+impl SolaceProperties {
+    /// Returns the configured RisingWave DSN, or the local-dev default.
+    pub fn risingwave_dsn_or_default(&self) -> &str {
+        self.risingwave_dsn
+            .as_deref()
+            .unwrap_or("host=localhost port=4566 user=root dbname=dev connect_timeout=5")
+    }
 }
 
 impl EnforceSecret for SolaceProperties {
@@ -208,6 +242,62 @@ mod test {
     }
 
     #[test]
+    fn test_parse_risingwave_dsn() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "solace.url".to_owned() => "tcp://localhost:55555".to_owned(),
+            "solace.queue".to_owned() => "test-queue".to_owned(),
+            "solace.risingwave_dsn".to_owned() => "host=rw-host port=4566 user=root dbname=prod".to_owned(),
+        };
+
+        let props: SolaceProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(
+            props.risingwave_dsn_or_default(),
+            "host=rw-host port=4566 user=root dbname=prod"
+        );
+    }
+
+    #[test]
+    fn test_risingwave_dsn_default() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "solace.url".to_owned() => "tcp://localhost:55555".to_owned(),
+            "solace.queue".to_owned() => "test-queue".to_owned(),
+        };
+
+        let props: SolaceProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(
+            props.risingwave_dsn_or_default(),
+            "host=localhost port=4566 user=root dbname=dev connect_timeout=5"
+        );
+    }
+
+    #[test]
+    fn test_parse_batch_size() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "solace.url".to_owned() => "tcp://localhost:55555".to_owned(),
+            "solace.queue".to_owned() => "test-queue".to_owned(),
+            "solace.batch_size".to_owned() => "250".to_owned(),
+        };
+
+        let props: SolaceProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(props.batch_size, Some(250));
+    }
+
+    #[test]
+    fn test_batch_size_default_is_none() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "solace.url".to_owned() => "tcp://localhost:55555".to_owned(),
+            "solace.queue".to_owned() => "test-queue".to_owned(),
+        };
+
+        let props: SolaceProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(props.batch_size, None);
+    }
+
+    #[test]
     fn test_parse_no_sentinel_readiness_topic() {
         let config: BTreeMap<String, String> = btreemap! {
             "solace.url".to_owned() => "tcp://localhost:55555".to_owned(),
@@ -217,6 +307,31 @@ mod test {
         let props: SolaceProperties =
             serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
         assert_eq!(props.sentinel_readiness_topic, None);
+    }
+
+    #[test]
+    fn test_parse_num_consumers() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "solace.url".to_owned() => "tcp://localhost:55555".to_owned(),
+            "solace.queue".to_owned() => "test-queue".to_owned(),
+            "solace.num_consumers".to_owned() => "4".to_owned(),
+        };
+
+        let props: SolaceProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(props.num_consumers, Some(4));
+    }
+
+    #[test]
+    fn test_num_consumers_default_is_none() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "solace.url".to_owned() => "tcp://localhost:55555".to_owned(),
+            "solace.queue".to_owned() => "test-queue".to_owned(),
+        };
+
+        let props: SolaceProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(props.num_consumers, None);
     }
 
     #[test]
