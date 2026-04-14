@@ -74,7 +74,14 @@ impl EnforceSecret for SolaceCommon {
 
 impl SolaceCommon {
     /// Build an async Solace session from the configured properties.
-    pub fn build_async_session(&self) -> ConnectorResult<(Context, AsyncSession)> {
+    ///
+    /// `client_name_override` takes precedence over `self.client_name` when provided.
+    /// This allows callers (e.g. parallel consumer readers) to bind with a per-split
+    /// unique name to avoid broker rejection of duplicate client names.
+    pub fn build_async_session(
+        &self,
+        client_name_override: Option<&str>,
+    ) -> ConnectorResult<(Context, AsyncSession)> {
         let context = Context::new(SolaceLogLevel::Warning)
             .map_err(|e| anyhow::anyhow!("failed to create Solace context: {e}"))?;
 
@@ -92,6 +99,13 @@ impl SolaceCommon {
             .password(password)
             .reconnect_retries(self.reconnect_retries.unwrap_or(-1))
             .reapply_subscriptions(true);
+
+        // Apply client name: override wins over configured name; omit if neither is set
+        // so the broker auto-assigns one.
+        let effective_name = client_name_override.or(self.client_name.as_deref());
+        if let Some(name) = effective_name {
+            builder = builder.client_name(name);
+        }
 
         if let Some(wait_ms) = self.reconnect_retry_wait_ms {
             builder = builder.reconnect_retry_wait_ms(wait_ms);

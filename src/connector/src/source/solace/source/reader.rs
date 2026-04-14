@@ -16,6 +16,7 @@ use std::sync::LazyLock;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::FutureExt;
 #[cfg(test)]
 use futures::future::OptionFuture;
 use futures_async_stream::try_stream;
@@ -73,6 +74,9 @@ pub struct SolaceSplitReader {
     events_before_sentinel: u64,
     /// Total business events consumed (excludes sentinel).
     total_consumed: u64,
+    /// Pending ack receiver for checkpoint mode. Drained at the top of each
+    /// read loop iteration instead of via a background task.
+    ack_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u64>>>,
 }
 
 #[async_trait]
@@ -95,41 +99,43 @@ impl SplitReader for SolaceSplitReader {
 
         let ack_mode = SolaceAckMode::from_str_opt(properties.ack_mode.as_deref())?;
 
+        // When num_consumers > 1, each reader must bind with a unique client name so the
+        // broker doesn't reject the second (and subsequent) connections as duplicates.
+        // Append the split ID to the configured base name; if no name was configured,
+        // pass None so the broker auto-assigns a distinct name for each session.
+        let num_consumers = properties.num_consumers.unwrap_or(1).max(1);
+        let effective_client_name: Option<String> = if num_consumers > 1 {
+            properties
+                .common
+                .client_name
+                .as_deref()
+                .map(|base| format!("{}-{}", base, split_id))
+        } else {
+            // Single-consumer: pass None here; build_async_session will use self.client_name.
+            None
+        };
+
         // Always use Client ack mode — we control when ack happens based on ack_mode.
-        let (context, session) = properties.common.build_async_session()?;
+        let (context, session) = properties
+            .common
+            .build_async_session(effective_client_name.as_deref())?;
         let flow = session
             .create_flow(&properties.queue, AckMode::Client)
             .map_err(|e| anyhow::anyhow!("failed to create Solace flow: {e}"))?;
 
-        // For checkpoint mode, set up the ack channel so WaitCheckpointTask can
-        // send message IDs back to us for acking.
-        if matches!(ack_mode, SolaceAckMode::Checkpoint) {
-            let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u64>>();
-            let channel_id =
-                build_solace_ack_channel_id(source_ctx.source_id, &split_id);
+        // For checkpoint mode, register the ack sender so WaitCheckpointTask can
+        // push message IDs to us, then store the receiver for inline draining.
+        let ack_rx = if matches!(ack_mode, SolaceAckMode::Checkpoint) {
+            let (ack_tx, ack_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u64>>();
+            let channel_id = build_solace_ack_channel_id(source_ctx.source_id, &split_id);
             SOLACE_ACK_CHANNEL
                 .entry(channel_id)
                 .and_upsert_with(|_| std::future::ready(ack_tx))
                 .await;
-
-            let flow_ptr = &flow as *const OwnedAsyncFlow as usize;
-            let source_name = source_ctx.source_name.clone();
-            tokio::spawn(async move {
-                while let Some(msg_ids) = ack_rx.recv().await {
-                    let flow_ref = unsafe { &*(flow_ptr as *const OwnedAsyncFlow) };
-                    for msg_id in msg_ids {
-                        if let Err(e) = flow_ref.ack(msg_id) {
-                            tracing::error!(
-                                source_name = %source_name,
-                                msg_id,
-                                error = %e,
-                                "failed to ack Solace message on checkpoint",
-                            );
-                        }
-                    }
-                }
-            });
-        }
+            Some(ack_rx)
+        } else {
+            None
+        };
 
         let reader = Self {
             flow,
@@ -144,6 +150,7 @@ impl SplitReader for SolaceSplitReader {
             sentinel_detected_at,
             events_before_sentinel: 0,
             total_consumed: 0,
+            ack_rx,
         };
 
         // On restart after sentinel: re-publish readiness event and re-write status
@@ -158,6 +165,7 @@ impl SplitReader for SolaceSplitReader {
             let det_at = reader.sentinel_detected_at.clone().unwrap_or_default();
             let _ = write_connector_status_pg(
                 &reader.properties.queue, &det_at, 0, 0, &now,
+                reader.properties.risingwave_dsn_or_default(),
             )
             .await;
             reader.publish_readiness_event_with_barrier(false);
@@ -203,6 +211,21 @@ impl SolaceSplitReader {
         let mut flush_rx: Option<oneshot::Receiver<()>> = None;
 
         loop {
+            // Drain any pending checkpoint acks before blocking on the next message.
+            if let Some(ref mut rx) = self.ack_rx {
+                while let Ok(msg_ids) = rx.try_recv() {
+                    for msg_id in msg_ids {
+                        if let Err(e) = self.flow.ack(msg_id) {
+                            tracing::error!(
+                                msg_id,
+                                error = %e,
+                                "failed to ack Solace message on checkpoint",
+                            );
+                        }
+                    }
+                }
+            }
+
             // Race message arrival against flush completion.
             // When no flush is pending, take the direct recv path (zero select overhead).
             let result = if let Some(ref mut rx) = flush_rx {
@@ -219,18 +242,42 @@ impl SolaceSplitReader {
                 }
 
                 RecvOrFlush::Msg(None) => {
-                    tracing::warn!("Solace flow recv returned None, flow disconnected");
-                    break;
+                    return Err(anyhow::anyhow!(
+                        "Solace flow disconnected — broker closed the flow (queue: {}). \
+                         Drop and recreate the source to recover.",
+                        self.properties.queue
+                    )
+                    .into());
                 }
 
                 RecvOrFlush::Msg(Some(msg)) => {
                     let msg_id = msg.get_msg_id().ok().flatten().unwrap_or(0);
                     let solace_msg = SolaceMessage::from_inbound(&msg, self.split_id.clone());
+                    if solace_msg.redelivered {
+                        tracing::warn!(
+                            queue = %self.properties.queue,
+                            msg_id,
+                            "Redelivered message received — possible duplicate",
+                        );
+                    }
 
                     // ── Sentinel detection ───────────────────────────────────
                     if solace_msg.is_sentinel() {
                         if let Err(e) = self.flow.ack(msg_id) {
                             tracing::warn!(msg_id, error = %e, "failed to ack sentinel");
+                        }
+
+                        // Sentinel detection is disabled for num_consumers > 1: a single
+                        // sentinel message is delivered to exactly one of N consumers, so
+                        // the remaining N-1 readers would never detect it.  Intercept the
+                        // sentinel (ack above) and discard without triggering backfill logic.
+                        if self.properties.num_consumers.unwrap_or(1) > 1 {
+                            tracing::warn!(
+                                queue = %self.properties.queue,
+                                "Sentinel received but detection is disabled for \
+                                 num_consumers > 1 — intercepted and discarded",
+                            );
+                            continue;
                         }
 
                         if self.sentinel_detected {
@@ -253,6 +300,7 @@ impl SolaceSplitReader {
                         let det_at = self.sentinel_detected_at.clone().unwrap_or_default();
                         let eb     = self.events_before_sentinel as i64;
                         let tc     = self.total_consumed as i64;
+                        let dsn    = self.properties.risingwave_dsn_or_default().to_owned();
 
                         let (flush_tx, rx) = oneshot::channel::<()>();
                         flush_rx = Some(rx);
@@ -260,7 +308,7 @@ impl SolaceSplitReader {
                         // Spawn WAIT task. Stream keeps flowing so the executor can
                         // checkpoint, which unblocks WAIT.
                         tokio::spawn(async move {
-                            if let Err(e) = barrier_flush_and_status(&queue, &det_at, eb, tc).await {
+                            if let Err(e) = barrier_flush_and_status(&queue, &det_at, eb, tc, &dsn).await {
                                 tracing::error!(error = %e, "Barrier flush failed — readiness will fire anyway");
                             }
                             let _ = flush_tx.send(());
@@ -279,7 +327,78 @@ impl SolaceSplitReader {
                         }
                     }
 
-                    yield vec![SourceMessage::from(solace_msg)];
+                    // ── Batch fill ──────────────────────────────────────────
+                    // Non-blockingly grab additional messages until the batch is
+                    // full or no more are immediately available.
+                    let batch_size = self.properties.batch_size.unwrap_or(100).max(1);
+                    let mut batch: Vec<SourceMessage> = Vec::with_capacity(batch_size);
+                    batch.push(SourceMessage::from(solace_msg));
+
+                    'fill: while batch.len() < batch_size {
+                        match self.flow.recv().now_or_never() {
+                            Some(Some(msg)) => {
+                                let msg_id = msg.get_msg_id().ok().flatten().unwrap_or(0);
+                                let sm = SolaceMessage::from_inbound(&msg, self.split_id.clone());
+                                if sm.redelivered {
+                                    tracing::warn!(
+                                        queue = %self.properties.queue,
+                                        msg_id,
+                                        "Redelivered message in batch fill — possible duplicate",
+                                    );
+                                }
+                                if sm.is_sentinel() {
+                                    if let Err(e) = self.flow.ack(msg_id) {
+                                        tracing::warn!(msg_id, error = %e, "failed to ack sentinel in batch fill");
+                                    }
+                                    if self.properties.num_consumers.unwrap_or(1) > 1 {
+                                        tracing::warn!(
+                                            queue = %self.properties.queue,
+                                            "Sentinel received in batch fill but detection is \
+                                             disabled for num_consumers > 1 — intercepted and discarded",
+                                        );
+                                        break 'fill;
+                                    }
+                                    if !self.sentinel_detected {
+                                        let now = Utc::now();
+                                        self.sentinel_detected = true;
+                                        self.sentinel_detected_at = Some(now.to_rfc3339());
+                                        self.events_before_sentinel = self.total_consumed;
+                                        tracing::info!(
+                                            queue = %self.properties.queue,
+                                            events_before_sentinel = self.events_before_sentinel,
+                                            "Sentinel detected in batch fill — spawning barrier flush task",
+                                        );
+                                        let queue  = self.properties.queue.clone();
+                                        let det_at = self.sentinel_detected_at.clone().unwrap_or_default();
+                                        let eb     = self.events_before_sentinel as i64;
+                                        let tc     = self.total_consumed as i64;
+                                        let dsn    = self.properties.risingwave_dsn_or_default().to_owned();
+                                        let (flush_tx, rx) = oneshot::channel::<()>();
+                                        flush_rx = Some(rx);
+                                        tokio::spawn(async move {
+                                            if let Err(e) = barrier_flush_and_status(&queue, &det_at, eb, tc, &dsn).await {
+                                                tracing::error!(error = %e, "Barrier flush failed — readiness will fire anyway");
+                                            }
+                                            let _ = flush_tx.send(());
+                                        });
+                                    } else {
+                                        tracing::warn!(queue = %self.properties.queue, "Duplicate sentinel in batch fill ignored");
+                                    }
+                                    break 'fill;
+                                }
+                                self.total_consumed += 1;
+                                if matches!(self.ack_mode, SolaceAckMode::Immediate) {
+                                    if let Err(e) = self.flow.ack(msg_id) {
+                                        tracing::warn!(msg_id, error = %e, "failed to immediately ack in batch fill");
+                                    }
+                                }
+                                batch.push(SourceMessage::from(sm));
+                            }
+                            _ => break 'fill,
+                        }
+                    }
+
+                    yield batch;
                 }
             }
         }
@@ -367,12 +486,9 @@ async fn write_connector_status_pg(
     events_before: i64,
     total: i64,
     now: &str,
+    dsn: &str,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (client, connection) = tokio_postgres::connect(
-        "host=localhost port=4566 user=root dbname=dev connect_timeout=5",
-        tokio_postgres::NoTls,
-    )
-    .await?;
+    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await?;
 
     // Spawn the connection handler — it exits when the client is dropped.
     tokio::spawn(async move {
@@ -394,6 +510,18 @@ async fn write_connector_status_pg(
             &[],
         )
         .await?;
+
+    // Schema-resilient upgrade path: add any columns that may be absent in older
+    // deployments. RisingWave supports ADD COLUMN IF NOT EXISTS.
+    for stmt in [
+        "ALTER TABLE rw_solace_connector_status ADD COLUMN IF NOT EXISTS is_ready BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE rw_solace_connector_status ADD COLUMN IF NOT EXISTS sentinel_detected_at VARCHAR",
+        "ALTER TABLE rw_solace_connector_status ADD COLUMN IF NOT EXISTS events_before_sentinel BIGINT",
+        "ALTER TABLE rw_solace_connector_status ADD COLUMN IF NOT EXISTS total_events_consumed BIGINT",
+        "ALTER TABLE rw_solace_connector_status ADD COLUMN IF NOT EXISTS last_updated VARCHAR",
+    ] {
+        client.execute(stmt, &[]).await?;
+    }
 
     client
         .execute(
@@ -435,12 +563,9 @@ async fn barrier_flush_and_status(
     detected_at: &str,
     events_before: i64,
     total: i64,
+    dsn: &str,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (client, conn) = tokio_postgres::connect(
-        "host=localhost port=4566 user=root dbname=dev connect_timeout=5",
-        tokio_postgres::NoTls,
-    )
-    .await?;
+    let (client, conn) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await?;
 
     tokio::spawn(async move { let _ = conn.await; });
 
@@ -449,7 +574,7 @@ async fn barrier_flush_and_status(
 
     // Write status only after WAIT confirms MV currency.
     write_connector_status_pg(queue, detected_at, events_before, total,
-                              &Utc::now().to_rfc3339()).await?;
+                              &Utc::now().to_rfc3339(), dsn).await?;
 
     tracing::info!(queue, "Barrier flush complete — all MVs current");
     Ok(())
@@ -615,6 +740,7 @@ mod test {
             "2026-04-13T12:00:00+00:00",
             100,
             105,
+            "host=localhost port=4566 user=root dbname=dev connect_timeout=5",
         )
         .await;
         // Accept both outcomes — the key invariant is no panic.
