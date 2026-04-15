@@ -26,10 +26,10 @@ on:
   workflow_dispatch:
     inputs:
       label:
-        description: 'Image label tag (e.g. solace-dev, test)'
+        description: 'Image label tag (e.g. solace-connector, test)'
         required: true
         type: string
-        default: 'solace-dev'
+        default: 'solace-connector'
       cargo_profile:
         description: 'Cargo build profile (release, patch-production)'
         required: true
@@ -39,7 +39,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/risingwave
-  DEFAULT_LABEL: solace-dev
+  DEFAULT_LABEL: solace-connector
   DEFAULT_PROFILE: release
 
 jobs:
