@@ -359,6 +359,8 @@ redundant_explicit_links = "allow"
 # See `docs/dev/src/build-and-run/profiles.md` for detailed information.
 [profile.dev]
 lto = "off"
+# Reduced from default (2) to lower linker memory usage on machines with limited swap
+debug = 1
 # use parallel frontend to speed up build
 # TODO: may consider applying to release/production profile as well
 # TODO: re-enable this after it's more stable. It causes many ICE in current version. https://github.com/rust-lang/rust/issues/143342

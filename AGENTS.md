@@ -66,6 +66,50 @@ When sandboxing is enabled, these commands need `require_escalated` because they
 - `./risedev slt './path/to/e2e-test-file.slt'` (connects to local TCP via psql protocol)
 - Any command that checks running services via local TCP (for example, health checks or custom SQL clients)
 
+## Docker Image Build
+
+The production Docker image is built via `docker/Dockerfile`. It compiles RisingWave from source inside the container using a multi-stage build.
+
+### Required build arg
+
+`CARGO_PROFILE` must always be passed — the Dockerfile does **not** set a default:
+
+```bash
+docker build -f docker/Dockerfile \
+  --build-arg CARGO_PROFILE=release \
+  -t risingwave/risingwave:solace-dev .
+```
+
+Omitting `--build-arg CARGO_PROFILE=release` causes cargo to fail immediately with:
+> `error: a value is required for '--profile <PROFILE-NAME>' but none was supplied`
+
+### Solace + OpenSSL conflict
+
+The Solace C SDK (solclient 7.26.1.8) bundles OpenSSL 1.1.x. `openssl-sys v0.9.109` requires OpenSSL 3.x APIs. Without mitigation, the final link of `risingwave_cmd_all` fails with:
+> `rust-lld: error: undefined symbol: EVP_CIPHER_get_iv_length`
+
+**Fix (already applied in two places):**
+
+1. **`docker/Dockerfile` line 77** — `ENV SOLACE_USE_SYSTEM_SSL=1` (for Docker builds)
+2. **`.cargo/config.toml` `[env]` section** — `SOLACE_USE_SYSTEM_SSL = "1"` (for local `./risedev b` builds)
+
+When `SOLACE_USE_SYSTEM_SSL` is set, `solace-rs-sys/build.rs` deletes the bundled OpenSSL files from the Solace SDK output directory and skips statically linking them, so the system OpenSSL 3.x is used instead.
+
+If the Solace SDK build cache exists from a prior run without the env var, delete it first:
+```bash
+rm -rf target/debug/build/solace-rs-sys-*/
+```
+
+### Local build configuration
+
+Active settings in `risedev-components.user.env`:
+- `ENABLE_BUILD_RUST=true`
+- `ENABLE_DYNAMIC_LINKING=true` — uses system shared libraries instead of bundled static deps; requires these system packages: `libzstd-dev libssl-dev liblz4-dev libsnappy-dev`
+
+Active settings in `.cargo/config.toml`:
+- `jobs = 4` — limits parallelism to avoid OOM on this machine
+- `SOLACE_USE_SYSTEM_SSL = "1"` — see above
+
 ## Connector Development
 
 See `docs/dev/src/connector/intro.md`.

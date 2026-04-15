@@ -74,6 +74,7 @@ WORKDIR /risingwave
 
 ENV ENABLE_BUILD_DASHBOARD=1
 ENV OPENSSL_STATIC=1
+ENV SOLACE_USE_SYSTEM_SSL=1
 
 RUN cargo fetch && \
   cargo build -p risingwave_cmd_all --profile ${CARGO_PROFILE} --features "rw-static-link" --features udf --features datafusion && \
