@@ -3,7 +3,11 @@ name: Build Docker Image (Fork)
 # Standalone Docker build workflow for forks — no Buildkite dependency.
 # Builds from source and pushes to GitHub Container Registry (ghcr.io).
 #
-# Usage:
+# Auto-triggers on push to feat/solace-source-connector when Rust source,
+# Cargo files, or the Dockerfile changes. Skipped for docs, tests, and
+# workflow-only changes.
+#
+# Manual usage:
 #   gh workflow run 'Build Docker Image (Fork)' --ref feat/solace-source-connector
 #   Or trigger via GitHub UI: Actions → Build Docker Image (Fork) → Run workflow
 #
@@ -12,6 +16,13 @@ name: Build Docker Image (Fork)
 #   ghcr.io/<owner>/risingwave:v<version>--<label>--<sha>--<branch>
 
 on:
+  push:
+    branches: [feat/solace-source-connector]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'e2e_test/**'
+      - '.github/workflows/**'
   workflow_dispatch:
     inputs:
       label:
@@ -28,6 +39,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/risingwave
+  DEFAULT_LABEL: solace-dev
+  DEFAULT_PROFILE: release
 
 jobs:
   build:
@@ -61,9 +74,10 @@ jobs:
           NO_SLASH_BRANCH=${BRANCH_NAME//\//-}
           VERSION=$(grep -m 1 '^version' Cargo.toml | cut -d '"' -f 2)
           COMMIT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
-          LABEL=${{ github.event.inputs.label }}
+          LABEL="${{ github.event.inputs.label || env.DEFAULT_LABEL }}"
           IMAGE_TAG="v${VERSION}--${LABEL}--${COMMIT_SHA}--${NO_SLASH_BRANCH}"
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "label=${LABEL}" >> "$GITHUB_OUTPUT"
           echo "Image tag: ${IMAGE_TAG}"
 
       - name: Set up Docker Buildx
@@ -76,10 +90,10 @@ jobs:
           file: docker/Dockerfile
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.label }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.label }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}
           build-args: |
-            CARGO_PROFILE=${{ github.event.inputs.cargo_profile }}
+            CARGO_PROFILE=${{ github.event.inputs.cargo_profile || env.DEFAULT_PROFILE }}
             GIT_SHA=${{ github.sha }}
           # Cache Docker layers in GitHub Actions cache.
           # First run is slow; subsequent runs on the same branch reuse cached layers.
