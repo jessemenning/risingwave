@@ -94,6 +94,10 @@ ENV OPENSSL_STATIC=1
 
 RUN --mount=type=secret,id=ACTIONS_RUNTIME_TOKEN \
   export ACTIONS_RUNTIME_TOKEN="$(cat /run/secrets/ACTIONS_RUNTIME_TOKEN 2>/dev/null || true)" && \
+  # If the token is absent, sccache can't reach the GHA cache backend and would
+  # fail to start its server, aborting the build. Disable sccache in that case
+  # so the build completes (uncached) rather than failing.
+  if [ -z "$ACTIONS_RUNTIME_TOKEN" ]; then unset RUSTC_WRAPPER; fi && \
   cargo fetch && \
   cargo build -p risingwave_cmd_all --profile ${CARGO_PROFILE} --features "rw-static-link" --features udf --features datafusion && \
   sccache --show-stats && \

@@ -83,6 +83,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Export sccache runtime token
+        # ACTIONS_RUNTIME_TOKEN is a runner-level env var, not accessible via
+        # ${{ env.* }} expressions by default. Write it to GITHUB_ENV so the
+        # build-push-action step can reference it as ${{ env.ACTIONS_RUNTIME_TOKEN }}.
+        run: echo "ACTIONS_RUNTIME_TOKEN=$ACTIONS_RUNTIME_TOKEN" >> $GITHUB_ENV
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
