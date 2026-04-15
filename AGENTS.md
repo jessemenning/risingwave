@@ -83,22 +83,9 @@ docker build -f docker/Dockerfile \
 Omitting `--build-arg CARGO_PROFILE=release` causes cargo to fail immediately with:
 > `error: a value is required for '--profile <PROFILE-NAME>' but none was supplied`
 
-### Solace + OpenSSL conflict
+### Solace C SDK version
 
-The Solace C SDK (solclient 7.26.1.8) bundles OpenSSL 1.1.x. `openssl-sys v0.9.109` requires OpenSSL 3.x APIs. Without mitigation, the final link of `risingwave_cmd_all` fails with:
-> `rust-lld: error: undefined symbol: EVP_CIPHER_get_iv_length`
-
-**Fix (already applied in two places):**
-
-1. **`docker/Dockerfile` line 77** — `ENV SOLACE_USE_SYSTEM_SSL=1` (for Docker builds)
-2. **`.cargo/config.toml` `[env]` section** — `SOLACE_USE_SYSTEM_SSL = "1"` (for local `./risedev b` builds)
-
-When `SOLACE_USE_SYSTEM_SSL` is set, `solace-rs-sys/build.rs` deletes the bundled OpenSSL files from the Solace SDK output directory and skips statically linking them, so the system OpenSSL 3.x is used instead.
-
-If the Solace SDK build cache exists from a prior run without the env var, delete it first:
-```bash
-rm -rf target/debug/build/solace-rs-sys-*/
-```
+The Solace C SDK (`solclient`) is **7.33.2.3**. OpenSSL 3.0.8 is statically embedded inside `libsolclient.a` — no separate ssl/crypto link targets exist. The linker only needs `static=solclient`. No `SOLACE_USE_SYSTEM_SSL` workaround is needed or present.
 
 ### Local build configuration
 
@@ -108,7 +95,6 @@ Active settings in `risedev-components.user.env`:
 
 Active settings in `.cargo/config.toml`:
 - `jobs = 4` — limits parallelism to avoid OOM on this machine
-- `SOLACE_USE_SYSTEM_SSL = "1"` — see above
 
 ## Connector Development
 

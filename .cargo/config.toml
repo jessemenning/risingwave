@@ -38,12 +38,6 @@ rustdocflags = ["-Zhigher-ranked-assumptions"]
 # Limit parallel jobs to avoid OOM-kills (swap exhausted on this machine)
 jobs = 4
 
-[env]
-# Use system OpenSSL instead of the OpenSSL 1.1.x bundled with the Solace C SDK.
-# openssl-sys v0.9.109 requires OpenSSL 3.x APIs; the bundled 1.1.x causes
-# undefined symbol errors (EVP_CIPHER_get_iv_length, SSL_get1_peer_certificate, etc.)
-SOLACE_USE_SYSTEM_SSL = "1"
-
 # We have large git dependencies. This can make cloning faster.
 # https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#git
 # Actually we also want to prevent submodule cloning completely
