@@ -40,6 +40,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout solace-rs
+        uses: actions/checkout@v4
+        with:
+          repository: jessemenning/solace-rs
+          path: solace-rs
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
