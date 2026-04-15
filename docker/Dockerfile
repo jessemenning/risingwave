@@ -62,6 +62,13 @@ RUN cargo install addr2line --features bin --bin addr2line
 
 FROM rust-base AS rust-builder
 
+# Install sccache for GitHub Actions build caching.
+# Uses a musl-static binary — no runtime library dependencies.
+RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-x86_64-unknown-linux-musl.tar.gz" \
+  | tar xz --strip-components=1 -C /usr/local/bin \
+    sccache-v0.8.1-x86_64-unknown-linux-musl/sccache \
+  && chmod +x /usr/local/bin/sccache
+
 # Build application
 ARG GIT_SHA
 ENV GIT_SHA=$GIT_SHA
@@ -69,14 +76,27 @@ ENV GIT_SHA=$GIT_SHA
 ARG CARGO_PROFILE
 ENV CARGO_PROFILE=$CARGO_PROFILE
 
+# sccache GitHub Actions cache backend.
+# Pass SCCACHE_GHA_ENABLED=true and ACTIONS_CACHE_URL as build-args,
+# and ACTIONS_RUNTIME_TOKEN as a BuildKit secret to enable remote caching.
+# Falls back to no-op (no caching) when args/secret are absent (local builds).
+ARG SCCACHE_GHA_ENABLED=false
+ENV SCCACHE_GHA_ENABLED=$SCCACHE_GHA_ENABLED
+ARG ACTIONS_CACHE_URL
+ENV ACTIONS_CACHE_URL=$ACTIONS_CACHE_URL
+ENV RUSTC_WRAPPER=/usr/local/bin/sccache
+
 COPY ./ /risingwave
 WORKDIR /risingwave
 
 ENV ENABLE_BUILD_DASHBOARD=1
 ENV OPENSSL_STATIC=1
 
-RUN cargo fetch && \
+RUN --mount=type=secret,id=ACTIONS_RUNTIME_TOKEN \
+  export ACTIONS_RUNTIME_TOKEN="$(cat /run/secrets/ACTIONS_RUNTIME_TOKEN 2>/dev/null || true)" && \
+  cargo fetch && \
   cargo build -p risingwave_cmd_all --profile ${CARGO_PROFILE} --features "rw-static-link" --features udf --features datafusion && \
+  sccache --show-stats && \
   mkdir -p /risingwave/bin && \
   mv /risingwave/target/${CARGO_PROFILE}/risingwave /risingwave/bin/ && \
   mv /risingwave/target/${CARGO_PROFILE}/risingwave.dwp /risingwave/bin/ && \

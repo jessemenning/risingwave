@@ -95,7 +95,12 @@ jobs:
           build-args: |
             CARGO_PROFILE=${{ github.event.inputs.cargo_profile || env.DEFAULT_PROFILE }}
             GIT_SHA=${{ github.sha }}
-          # Cache Docker layers in GitHub Actions cache.
-          # First run is slow; subsequent runs on the same branch reuse cached layers.
+            SCCACHE_GHA_ENABLED=true
+            ACTIONS_CACHE_URL=${{ env.ACTIONS_CACHE_URL }}
+          secrets: |
+            ACTIONS_RUNTIME_TOKEN=${{ env.ACTIONS_RUNTIME_TOKEN }}
+          # sccache caches individual crate compilations across builds (GHA backend).
+          # Docker layer cache (type=gha) caches layers that don't change between runs.
+          # Together they cover both cases: unchanged layers and changed-but-cached crates.
           cache-from: type=gha
           cache-to: type=gha,mode=max
