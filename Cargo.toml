@@ -387,6 +387,12 @@ lto = "thin"
 inherits = "production"
 debug = 0 # no debug info, only symbols
 
+# Fast developer build for Docker images: no optimizations, debug info stripped.
+# Use when you need a quick image for connector testing and don't need debug-ability.
+[profile.dev-docker]
+inherits = "dev"
+strip = "debuginfo"
+
 [profile.ci-release]
 inherits = "release"
 incremental = false

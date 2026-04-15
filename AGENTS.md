@@ -77,15 +77,43 @@ The production Docker image is built via `docker/Dockerfile`. It compiles Rising
 ```bash
 docker build -f docker/Dockerfile \
   --build-arg CARGO_PROFILE=release \
-  -t risingwave/risingwave:solace-dev .
+  -t risingwave/risingwave:solace-connector .
 ```
 
 Omitting `--build-arg CARGO_PROFILE=release` causes cargo to fail immediately with:
 > `error: a value is required for '--profile <PROFILE-NAME>' but none was supplied`
 
+### GitHub Actions workflow (fork)
+
+The fork has `.github/workflows/build-docker-image-fork.yml` which builds and pushes to `ghcr.io/jessemenning/risingwave`. To trigger manually:
+
+```bash
+gh workflow run "build-docker-image-fork.yml" --repo jessemenning/risingwave --ref feat/solace-source-connector
+```
+
+**Important:** Always push to the `fork` remote (not `origin`, which points to upstream `risingwavelabs/risingwave`):
+
+```bash
+git push fork feat/solace-source-connector
+```
+
+The workflow pushes to the `:solace-connector` tag by default — that is what the FAA project's `docker-compose.yml` pulls. Do not change `DEFAULT_LABEL` to anything else.
+
+Note: `gh workflow list` shows upstream workflows when run from this directory — always pass `--repo jessemenning/risingwave` explicitly.
+
+### sccache (GHA backend)
+
+sccache wraps `rustc` inside the container for crate-level caching across builds. It requires `ACTIONS_RUNTIME_TOKEN` passed as a BuildKit secret. The Dockerfile includes a graceful fallback: if the token is absent (local builds), `RUSTC_WRAPPER` is unset so the build proceeds uncached rather than failing. Cold builds take ~30–45 minutes.
+
 ### Solace C SDK version
 
 The Solace C SDK (`solclient`) is **7.33.2.3**. OpenSSL 3.0.8 is statically embedded inside `libsolclient.a` — no separate ssl/crypto link targets exist. The linker only needs `static=solclient`. No `SOLACE_USE_SYSTEM_SSL` workaround is needed or present.
+
+### solace-rs API extensions
+
+The connector (`src/connector/src/source/solace/`) depends on methods not in upstream `solace-rs`. They live in `jessemenning/solace-rs` on `main`, which is checked out during the GHA build. If a new connector feature needs a missing C SDK binding, add it to `solace-rs/src/message/inbound.rs` (or `async_support.rs`) and push to that repo before triggering the Docker build.
+
+Methods added beyond upstream: `is_redelivered`, `get_replication_group_message_id`, `get_payload_as_string`, `get_rcv_timestamp` (on `InboundMessage`); `client_name` (on `AsyncSessionBuilder`).
 
 ### Local build configuration
 

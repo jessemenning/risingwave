@@ -75,6 +75,13 @@ jobs:
           VERSION=$(grep -m 1 '^version' Cargo.toml | cut -d '"' -f 2)
           COMMIT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
           LABEL="${{ github.event.inputs.label || env.DEFAULT_LABEL }}"
+          PROFILE="${{ github.event.inputs.cargo_profile || env.DEFAULT_PROFILE }}"
+          # Append profile to label unless it's the default (release), so
+          # release builds keep the stable :solace-connector tag while
+          # dev-docker / ci-dev etc. get their own tags e.g. :solace-connector-dev-docker
+          if [ "${PROFILE}" != "release" ]; then
+            LABEL="${LABEL}-${PROFILE}"
+          fi
           IMAGE_TAG="v${VERSION}--${LABEL}--${COMMIT_SHA}--${NO_SLASH_BRANCH}"
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "label=${LABEL}" >> "$GITHUB_OUTPUT"
