@@ -19,10 +19,12 @@ all-sinks = [
     "sink-clickhouse",
     "sink-doris",
     "sink-starrocks",
+    "sink-solace",
 ]
 all-sources = ["source-adbc_snowflake", "source-solace"]
 source-adbc_snowflake = ["dep:adbc_core", "dep:adbc_snowflake"]
 source-solace = ["dep:solace-rs"]
+sink-solace = ["dep:solace-rs"]
 sink-bigquery = [
     "dep:gcp-bigquery-client",
     "dep:google-cloud-bigquery",

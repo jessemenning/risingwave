@@ -40,6 +40,7 @@ pub mod mongodb;
 pub mod mqtt;
 pub mod nats;
 pub mod postgres;
+feature_gated_sink_mod!(solace, "solace");
 pub mod pulsar;
 pub mod redis;
 pub mod remote;
@@ -131,6 +132,7 @@ macro_rules! for_all_sinks {
                 { Mqtt, $crate::sink::mqtt::MqttSink, $crate::sink::mqtt::MqttConfig },
                 { GooglePubSub, $crate::sink::google_pubsub::GooglePubSubSink, $crate::sink::google_pubsub::GooglePubSubConfig },
                 { Nats, $crate::sink::nats::NatsSink, $crate::sink::nats::NatsConfig },
+                { Solace, $crate::sink::solace::SolaceSink, $crate::sink::solace::SolaceConfig },
                 { Jdbc, $crate::sink::remote::JdbcSink, () },
                 { ElasticSearch, $crate::sink::elasticsearch_opensearch::elasticsearch::ElasticSearchSink, $crate::sink::elasticsearch_opensearch::elasticsearch_opensearch_config::ElasticSearchConfig },
                 { Opensearch, $crate::sink::elasticsearch_opensearch::opensearch::OpenSearchSink, $crate::sink::elasticsearch_opensearch::elasticsearch_opensearch_config::OpenSearchConfig },
@@ -1001,6 +1003,12 @@ pub enum SinkError {
     ),
     #[error("Nats error: {0}")]
     Nats(
+        #[source]
+        #[backtrace]
+        anyhow::Error,
+    ),
+    #[error("Solace error: {0}")]
+    Solace(
         #[source]
         #[backtrace]
         anyhow::Error,
