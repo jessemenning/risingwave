@@ -7,9 +7,14 @@ name: Build Docker Image (Fork)
 # Cargo files, or the Dockerfile changes. Skipped for docs, tests, and
 # workflow-only changes.
 #
-# Manual usage:
-#   gh workflow run 'Build Docker Image (Fork)' --ref feat/solace-source-connector
-#   Or trigger via GitHub UI: Actions → Build Docker Image (Fork) → Run workflow
+# Manual usage (cargo_profile is REQUIRED):
+#   gh workflow run 'Build Docker Image (Fork)' --ref feat/solace-sink-connector --field cargo_profile=dev
+#   gh workflow run 'Build Docker Image (Fork)' --ref feat/solace-sink-connector --field cargo_profile=release
+#   Or trigger via GitHub UI: Actions → Build Docker Image (Fork) → Run workflow (select profile from dropdown)
+#
+# Build times (cold, no sccache hit):
+#   dev     ~30 min   — unoptimized, good for smoke-testing
+#   release ~60-70 min — production image
 #
 # Image is pushed to:
 #   ghcr.io/<owner>/risingwave:<label>
@@ -31,16 +36,18 @@ on:
         type: string
         default: 'solace-connector'
       cargo_profile:
-        description: 'Cargo build profile (release, patch-production)'
+        description: 'Cargo build profile — dev ~30 min, release ~60-70 min'
         required: true
-        type: string
-        default: 'release'
+        type: choice
+        options:
+          - dev
+          - release
+          - patch-production
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/risingwave
   DEFAULT_LABEL: solace-connector
-  DEFAULT_PROFILE: release
 
 jobs:
   build:
@@ -75,7 +82,7 @@ jobs:
           VERSION=$(grep -m 1 '^version' Cargo.toml | cut -d '"' -f 2)
           COMMIT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
           LABEL="${{ github.event.inputs.label || env.DEFAULT_LABEL }}"
-          PROFILE="${{ github.event.inputs.cargo_profile || env.DEFAULT_PROFILE }}"
+          PROFILE="${{ github.event.inputs.cargo_profile }}"
           # Append profile to label unless it's the default (release), so
           # release builds keep the stable :solace-connector tag while
           # dev-docker / ci-dev etc. get their own tags e.g. :solace-connector-dev-docker
@@ -115,7 +122,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.label }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}
           build-args: |
-            CARGO_PROFILE=${{ github.event.inputs.cargo_profile || env.DEFAULT_PROFILE }}
+            CARGO_PROFILE=${{ github.event.inputs.cargo_profile }}
             GIT_SHA=${{ github.sha }}
             SCCACHE_GHA_ENABLED=true
             ACTIONS_CACHE_URL=${{ env.SCCACHE_CACHE_URL }}
