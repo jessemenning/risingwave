@@ -101,10 +101,12 @@ RUN --mount=type=secret,id=ACTIONS_RUNTIME_TOKEN \
   cargo fetch && \
   cargo build -p risingwave_cmd_all --profile ${CARGO_PROFILE} --features "rw-static-link" --features udf --features datafusion && \
   sccache --show-stats && \
+  TARGET_DIR="${CARGO_PROFILE}" && \
+  [ "${CARGO_PROFILE}" = "dev" ] && TARGET_DIR="debug" ; \
   mkdir -p /risingwave/bin && \
-  mv /risingwave/target/${CARGO_PROFILE}/risingwave /risingwave/bin/ && \
-  mv /risingwave/target/${CARGO_PROFILE}/risingwave.dwp /risingwave/bin/ && \
-  cp ./target/${CARGO_PROFILE}/build/tikv-jemalloc-sys-*/out/build/bin/jeprof /risingwave/bin/ && \
+  mv /risingwave/target/${TARGET_DIR}/risingwave /risingwave/bin/ && \
+  mv /risingwave/target/${TARGET_DIR}/risingwave.dwp /risingwave/bin/ && \
+  cp ./target/${TARGET_DIR}/build/tikv-jemalloc-sys-*/out/build/bin/jeprof /risingwave/bin/ && \
   chmod +x /risingwave/bin/jeprof && \
   mkdir -p /risingwave/lib/adbc && \
   # Download ADBC Snowflake driver shared library for runtime (avoid invoking risedev/cargo-make here).
