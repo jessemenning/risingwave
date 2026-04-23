@@ -105,7 +105,7 @@ RUN --mount=type=secret,id=ACTIONS_RUNTIME_TOKEN \
   [ "${CARGO_PROFILE}" = "dev" ] && TARGET_DIR="debug" ; \
   mkdir -p /risingwave/bin && \
   mv /risingwave/target/${TARGET_DIR}/risingwave /risingwave/bin/ && \
-  mv /risingwave/target/${TARGET_DIR}/risingwave.dwp /risingwave/bin/ && \
+  { [ -f /risingwave/target/${TARGET_DIR}/risingwave.dwp ] && mv /risingwave/target/${TARGET_DIR}/risingwave.dwp /risingwave/bin/ || true; } && \
   cp ./target/${TARGET_DIR}/build/tikv-jemalloc-sys-*/out/build/bin/jeprof /risingwave/bin/ && \
   chmod +x /risingwave/bin/jeprof && \
   mkdir -p /risingwave/lib/adbc && \
