@@ -456,7 +456,7 @@ mod test {
         assert!(!msg.payload.is_empty());
     }
 
-    // ── SolaceMeta extract_* method tests ───────────────────────────────
+    // -- SolaceMeta extract_* method tests --
 
     fn make_meta_full() -> SolaceMeta {
         let ts = Timestamptz::from_millis(1_700_000_000_000).unwrap();

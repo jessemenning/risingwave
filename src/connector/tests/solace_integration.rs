@@ -449,12 +449,13 @@ async fn test_non_persistent_publish_and_receive() {
         .publish_with_ack(msg)
         .expect("publish_with_ack failed");
 
-    // Await the broker ACK for the NonPersistent send.
+    // For NonPersistent, the future resolves locally (not from a broker ACK) — verify no
+    // send-side error.
     let ack_result: Result<(), SessionError> = tokio::time::timeout(RECV_TIMEOUT, ack_future)
         .await
-        .expect("timed out waiting for NonPersistent ACK")
-        .expect("ACK channel closed");
-    assert!(ack_result.is_ok(), "broker rejected NonPersistent message: {:?}", ack_result);
+        .expect("timed out waiting for NonPersistent send to resolve")
+        .expect("send channel closed");
+    assert!(ack_result.is_ok(), "NonPersistent send returned an error: {:?}", ack_result);
 
     let received = tokio::time::timeout(RECV_TIMEOUT, sub_session.recv())
         .await
@@ -512,9 +513,14 @@ async fn test_batch_messages_received_via_try_recv() {
     assert!(first.get_payload().unwrap().unwrap().starts_with(b"batch-msg-"));
 
     // Drain the remaining 4 via try_recv (non-blocking).
+    // Cap at 10 to avoid an infinite loop if leftover messages from a prior failed test run are
+    // sitting in TEST_QUEUE; the exact-5 assertion below will still catch any discrepancy.
     let mut count = 1usize;
     tokio::time::sleep(SLEEP_TIME).await;
-    while flow.try_recv().is_ok() {
+    for _ in 0..10 {
+        if flow.try_recv().is_err() {
+            break;
+        }
         count += 1;
     }
     assert_eq!(count, 5, "expected 5 messages, got {count}");
