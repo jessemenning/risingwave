@@ -100,3 +100,5 @@ solace-risingwave-backfill-prompt_1.md
 
 # Code agent temporary files
 docs/superpowers
+.claude/settings.json
+src/connector/src/source/solace/docs/fix-known-issues-prompt.md
