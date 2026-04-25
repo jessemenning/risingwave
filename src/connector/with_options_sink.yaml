@@ -1668,6 +1668,73 @@ SnowflakeV2Config:
   - name: stage
     field_type: String
     required: false
+SolaceConfig:
+  fields:
+  - name: common
+    field_type: SolaceCommon
+    required: true
+  - name: solace.topic
+    field_type: String
+    comments: |-
+      Parameterized topic string, e.g. `acme/orders/{region}/{status}/v1`.
+      Each `{column_name}` placeholder is replaced with the column's value at write time.
+    required: true
+  - name: solace.delivery_mode
+    field_type: String
+    comments: 'SMF delivery mode: "direct" (default), "persistent", or "non_persistent".'
+    required: false
+    default: '"direct" . to_owned ()'
+  - name: solace.dedup_key
+    field_type: String
+    comments: |-
+      Comma-separated list of column names used as a deduplication key.
+      When set, messages with the same key value are suppressed until
+      `solace.dedup_window` has elapsed since the last emission.
+    required: false
+  - name: solace.dedup_window
+    field_type: String
+    comments: |-
+      Duration during which repeat emissions for the same dedup key are suppressed.
+      Accepts "Xs" (seconds), "Xm" (minutes), "Xh" (hours), or a plain integer
+      number of seconds (e.g. "300", "5m", "1h"). Required when `solace.dedup_key` is set.
+    required: false
+  - name: solace.null_topic_behavior
+    field_type: String
+    comments: |-
+      How to handle a NULL column value when rendering the topic template.
+      - `"error"` (default): return an error and fail the row
+      - `"skip"`: silently drop the row without publishing
+      - `"replace:<value>"`: substitute a literal string for the NULL segment
+    required: false
+    default: '"error" . to_owned ()'
+  - name: solace.max_message_bytes
+    field_type: usize
+    comments: |-
+      Maximum payload size in bytes. Messages exceeding this limit are dropped
+      with a warning instead of being sent. Useful for avoiding broker rejections
+      when the Solace broker max message size is below the default 10 MB (10485760).
+      When unset, no size limit is enforced.
+    required: false
+  - name: solace.date_handling_mode
+    field_type: String
+    comments: |-
+      How to encode DATE columns in the JSON payload.
+      - `"from_ce"` (default): integer days since the Common Era epoch (0001-01-01)
+      - `"from_epoch"`: integer days since the Unix epoch (1970-01-01)
+      - `"string"`: ISO 8601 string (e.g. `"2024-04-25"`)
+    required: false
+    default: '"from_ce" . to_owned ()'
+  - name: solace.timestamp_handling_mode
+    field_type: String
+    comments: |-
+      How to encode TIMESTAMP columns in the JSON payload.
+      - `"milli"` (default): integer milliseconds since Unix epoch
+      - `"string"`: ISO 8601 string
+    required: false
+    default: '"milli" . to_owned ()'
+  - name: r#type
+    field_type: String
+    required: true
 SqlServerConfig:
   fields:
   - name: sqlserver.host

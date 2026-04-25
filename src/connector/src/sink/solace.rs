@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
+use futures::FutureExt;
+use futures::prelude::TryFuture;
 use risingwave_common::array::{Op, StreamChunk};
 use risingwave_common::catalog::Schema;
 use risingwave_common::row::Row;
@@ -44,6 +46,9 @@ use solace_rs::message::outbound::OutboundMessageBuilder;
 
 pub const SOLACE_SINK: &str = "solace";
 
+pub type SolaceSinkDeliveryFuture =
+    impl TryFuture<Ok = (), Error = SinkError> + Unpin + 'static;
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -66,6 +71,8 @@ pub struct SolaceConfig {
     /// Comma-separated list of column names used as a deduplication key.
     /// When set, messages with the same key value are suppressed until
     /// `solace.dedup_window` has elapsed since the last emission.
+    /// Dedup state is in-memory only and resets on connector restart;
+    /// a key suppressed before restart may re-emit once immediately after restart.
     #[serde(rename = "solace.dedup_key")]
     pub dedup_key: Option<String>,
 
@@ -90,6 +97,19 @@ pub struct SolaceConfig {
     #[serde(rename = "solace.max_message_bytes")]
     pub max_message_bytes: Option<usize>,
 
+    /// How to encode DATE columns in the JSON payload.
+    /// - `"from_ce"` (default): integer days since the Common Era epoch (0001-01-01)
+    /// - `"from_epoch"`: integer days since the Unix epoch (1970-01-01)
+    /// - `"string"`: ISO 8601 string (e.g. `"2024-04-25"`)
+    #[serde(rename = "solace.date_handling_mode", default = "default_date_handling_mode")]
+    pub date_handling_mode: String,
+
+    /// How to encode TIMESTAMP columns in the JSON payload.
+    /// - `"milli"` (default): integer milliseconds since Unix epoch
+    /// - `"string"`: ISO 8601 string
+    #[serde(rename = "solace.timestamp_handling_mode", default = "default_timestamp_handling_mode")]
+    pub timestamp_handling_mode: String,
+
     // accept "append-only"
     pub r#type: String,
 }
@@ -102,10 +122,21 @@ fn default_null_topic_behavior() -> String {
     "error".to_owned()
 }
 
+fn default_date_handling_mode() -> String {
+    "from_ce".to_owned()
+}
+
+fn default_timestamp_handling_mode() -> String {
+    "milli".to_owned()
+}
+
 impl SolaceConfig {
     pub fn from_btreemap(values: BTreeMap<String, String>) -> Result<Self> {
-        let config = serde_json::from_value::<SolaceConfig>(serde_json::to_value(values).unwrap())
-            .map_err(|e| SinkError::Config(anyhow!(e)))?;
+        let config = serde_json::from_value::<SolaceConfig>(
+            serde_json::to_value(values)
+                .expect("BTreeMap<String, String> is always JSON-serializable"),
+        )
+        .map_err(|e| SinkError::Config(anyhow!(e)))?;
         if config.r#type != SINK_TYPE_APPEND_ONLY {
             return Err(SinkError::Config(anyhow!(
                 "Solace sink only supports append-only mode"
@@ -281,8 +312,10 @@ fn scalar_for_dedup_key(scalar: ScalarRefImpl<'_>) -> String {
 
 #[derive(Debug)]
 struct DedupFilter {
-    last_emitted: HashMap<String, Instant>,
-    window: Duration,
+    cur:             HashSet<String>,
+    prev:            HashSet<String>,
+    cur_start:       Instant,
+    half_window:     Duration,
     key_col_indices: Vec<usize>,
 }
 
@@ -317,8 +350,10 @@ impl DedupFilter {
             })
             .collect();
         Ok(Self {
-            last_emitted: HashMap::new(),
-            window,
+            cur:         HashSet::new(),
+            prev:        HashSet::new(),
+            cur_start:   Instant::now(),
+            half_window: window / 2,
             key_col_indices: indices?,
         })
     }
@@ -342,17 +377,16 @@ impl DedupFilter {
         let key = self.build_key(row);
         let now = Instant::now();
 
-        // Prune entries that have fully expired to bound memory usage.
-        self.last_emitted
-            .retain(|_, ts| now.duration_since(*ts) < self.window);
-
-        match self.last_emitted.get(&key) {
-            Some(ts) if now.duration_since(*ts) < self.window => false,
-            _ => {
-                self.last_emitted.insert(key, now);
-                true
-            }
+        if now >= self.cur_start + self.half_window {
+            self.prev = std::mem::take(&mut self.cur);
+            self.cur_start = now;
         }
+
+        if self.cur.contains(&key) || self.prev.contains(&key) {
+            return false;
+        }
+        self.cur.insert(key);
+        true
     }
 }
 
@@ -416,20 +450,45 @@ fn parse_delivery_mode(s: &str) -> Result<SolaceDeliveryMode> {
     }
 }
 
-fn build_json_encoder(schema: &Schema, format_desc: &SinkFormatDesc) -> Result<JsonEncoder> {
+fn parse_date_handling_mode(s: &str) -> Result<DateHandlingMode> {
+    match s {
+        "from_ce" => Ok(DateHandlingMode::FromCe),
+        "from_epoch" => Ok(DateHandlingMode::FromEpoch),
+        "string" => Ok(DateHandlingMode::String),
+        other => Err(SinkError::Config(anyhow!(
+            "invalid solace.date_handling_mode '{}', expected 'from_ce', 'from_epoch', or 'string'",
+            other
+        ))),
+    }
+}
+
+fn parse_timestamp_handling_mode(s: &str) -> Result<TimestampHandlingMode> {
+    match s {
+        "milli" => Ok(TimestampHandlingMode::Milli),
+        "string" => Ok(TimestampHandlingMode::String),
+        other => Err(SinkError::Config(anyhow!(
+            "invalid solace.timestamp_handling_mode '{}', expected 'milli' or 'string'",
+            other
+        ))),
+    }
+}
+
+fn build_json_encoder(
+    schema: &Schema,
+    format_desc: &SinkFormatDesc,
+    config: &SolaceConfig,
+) -> Result<JsonEncoder> {
     let timestamptz_mode = TimestamptzHandlingMode::from_options(&format_desc.options)?;
     let jsonb_handling_mode = JsonbHandlingMode::from_options(&format_desc.options)?;
+    let date_mode = parse_date_handling_mode(&config.date_handling_mode)?;
+    let ts_mode = parse_timestamp_handling_mode(&config.timestamp_handling_mode)?;
     match &format_desc.format {
         SinkFormat::AppendOnly => match &format_desc.encode {
             SinkEncode::Json => Ok(JsonEncoder::new(
                 schema.clone(),
                 None,
-                // DateHandlingMode::FromCe: dates are emitted as integer days since the
-                // Common Era epoch (0001-01-01). TimestampHandlingMode::Milli: timestamps
-                // are emitted as milliseconds since Unix epoch. These choices are intentional
-                // and documented in the Solace connector reference.
-                DateHandlingMode::FromCe,
-                TimestampHandlingMode::Milli,
+                date_mode,
+                ts_mode,
                 timestamptz_mode,
                 TimeHandlingMode::Milli,
                 jsonb_handling_mode,
@@ -519,7 +578,7 @@ impl Sink for SolaceSink {
         }
 
         // Validate encoder config.
-        build_json_encoder(&self.schema, &self.format_desc)?;
+        build_json_encoder(&self.schema, &self.format_desc, &self.config)?;
 
         // Broker smoke-test: verify we can connect.
         let (_ctx, _session) = self
@@ -567,7 +626,7 @@ impl SolaceSinkWriter {
         let null_behavior = parse_null_topic_behavior(&config.null_topic_behavior)?;
         let topic_template = TopicTemplate::parse(&config.topic_template, &schema, null_behavior)?;
         let delivery_mode = parse_delivery_mode(&config.delivery_mode)?;
-        let encoder = build_json_encoder(&schema, format_desc)?;
+        let encoder = build_json_encoder(&schema, format_desc, &config)?;
         let max_message_bytes = config.max_message_bytes;
 
         let dedup_filter = if let Some(ref key) = config.dedup_key {
@@ -600,16 +659,18 @@ impl SolaceSinkWriter {
 }
 
 impl AsyncTruncateSinkWriter for SolaceSinkWriter {
-    // NOTE: _add_future is intentionally unused. Solace publish() is fire-and-forget —
-    // no broker-side delivery confirmation is awaited. For direct and non_persistent
-    // modes this is by design. For persistent mode, the broker ACK is not tracked by
-    // this connector, so RisingWave considers a chunk successful as soon as publish()
-    // returns without a session error. If confirmed delivery semantics are required,
-    // the publish future must be wired into _add_future.
+    type DeliveryFuture = SolaceSinkDeliveryFuture;
+
+    /// For `delivery_mode = "direct"` this is fire-and-forget — broker acknowledgement
+    /// is never requested. For `"persistent"` and `"non_persistent"` modes, each message
+    /// is published with a correlation tag and the resulting broker ACK future is registered
+    /// with `add_future`, so RisingWave does not advance its checkpoint until the broker
+    /// has confirmed delivery.
+    #[define_opaque(SolaceSinkDeliveryFuture)]
     async fn write_chunk<'a>(
         &'a mut self,
         chunk: StreamChunk,
-        _add_future: DeliveryFutureManagerAddFuture<'a, Self::DeliveryFuture>,
+        mut add_future: DeliveryFutureManagerAddFuture<'a, Self::DeliveryFuture>,
     ) -> Result<()> {
         for (op, row) in chunk.rows() {
             if op != Op::Insert {
@@ -656,9 +717,29 @@ impl AsyncTruncateSinkWriter for SolaceSinkWriter {
                 .build()
                 .map_err(|e| SinkError::Solace(anyhow!("failed to build Solace message: {}", e)))?;
 
-            self.session
-                .publish(msg)
-                .map_err(|e: SessionError| SinkError::Solace(anyhow!("Solace publish error: {}", e)))?;
+            match self.delivery_mode {
+                SolaceDeliveryMode::Direct => {
+                    self.session
+                        .publish(msg)
+                        .map_err(|e: SessionError| SinkError::Solace(anyhow!("Solace publish error: {}", e)))?;
+                }
+                SolaceDeliveryMode::Persistent | SolaceDeliveryMode::NonPersistent => {
+                    let ack_rx = self
+                        .session
+                        .publish_with_ack(msg)
+                        .map_err(|e: SessionError| SinkError::Solace(anyhow!("Solace publish error: {}", e)))?;
+                    let future = ack_rx.map(|r| match r {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => {
+                            Err(SinkError::Solace(anyhow!("Solace broker rejected message: {}", e)))
+                        }
+                        Err(_) => Err(SinkError::Solace(anyhow!(
+                            "Solace ACK receiver dropped before broker confirmed delivery"
+                        ))),
+                    });
+                    add_future.add_future_may_await(future).await?;
+                }
+            }
         }
 
         Ok(())
@@ -993,5 +1074,81 @@ mod tests {
     #[test]
     fn test_parse_delivery_mode_invalid() {
         assert!(parse_delivery_mode("bogus").is_err());
+    }
+
+    // -- parse_date_handling_mode tests --
+
+    #[test]
+    fn test_parse_date_handling_mode_from_ce() {
+        assert!(matches!(
+            parse_date_handling_mode("from_ce"),
+            Ok(DateHandlingMode::FromCe)
+        ));
+    }
+
+    #[test]
+    fn test_parse_date_handling_mode_from_epoch() {
+        assert!(matches!(
+            parse_date_handling_mode("from_epoch"),
+            Ok(DateHandlingMode::FromEpoch)
+        ));
+    }
+
+    #[test]
+    fn test_parse_date_handling_mode_string() {
+        assert!(matches!(
+            parse_date_handling_mode("string"),
+            Ok(DateHandlingMode::String)
+        ));
+    }
+
+    #[test]
+    fn test_parse_date_handling_mode_invalid() {
+        assert!(parse_date_handling_mode("unix").is_err());
+    }
+
+    // -- parse_timestamp_handling_mode tests --
+
+    #[test]
+    fn test_parse_timestamp_handling_mode_milli() {
+        assert!(matches!(
+            parse_timestamp_handling_mode("milli"),
+            Ok(TimestampHandlingMode::Milli)
+        ));
+    }
+
+    #[test]
+    fn test_parse_timestamp_handling_mode_string() {
+        assert!(matches!(
+            parse_timestamp_handling_mode("string"),
+            Ok(TimestampHandlingMode::String)
+        ));
+    }
+
+    #[test]
+    fn test_parse_timestamp_handling_mode_invalid() {
+        assert!(parse_timestamp_handling_mode("micro").is_err());
+    }
+
+    #[test]
+    fn test_dedup_filter_window_expires() {
+        let schema = schema_one_varchar();
+        let mut filter =
+            DedupFilter::new("flight_id", Duration::from_millis(10), &schema).unwrap();
+
+        let chunk = DataChunk::from_pretty(
+            "T
+             AAL100",
+        );
+        let row = chunk.row_at(0).0;
+
+        assert!(filter.should_emit(row), "first emission allowed");
+        assert!(!filter.should_emit(row), "repeat within window suppressed");
+
+        // Two calls each separated by > half_window advance through both buckets.
+        std::thread::sleep(Duration::from_millis(6));
+        filter.should_emit(row); // first rotation: key moves to prev
+        std::thread::sleep(Duration::from_millis(6));
+        assert!(filter.should_emit(row), "key should re-emit after full window expires");
     }
 }

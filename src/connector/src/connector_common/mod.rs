@@ -17,9 +17,9 @@
 mod mqtt_common;
 pub use mqtt_common::{MqttCommon, QualityOfService as MqttQualityOfService};
 
-#[cfg(feature = "source-solace")]
+#[cfg(any(feature = "source-solace", feature = "sink-solace"))]
 mod solace_common;
-#[cfg(feature = "source-solace")]
+#[cfg(any(feature = "source-solace", feature = "sink-solace"))]
 pub use solace_common::SolaceCommon;
 
 mod common;

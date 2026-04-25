@@ -1,118 +1,68 @@
-# Solace Parallel Consumers — Sentinel Backfill Detection Roadmap
+# Solace Parallel Consumers — Sentinel Backfill Detection
 
-## Current state: Option D (shipped)
+## How it works
 
 `solace.num_consumers = N` causes the enumerator to return N splits (IDs `"0"`
-through `"N-1"`).  Each split gets its own `SolaceSplitReader` and its own
-Solace flow bound to the same queue.  The broker load-balances messages across
-all bound flows.
+through `"N-1"`). Each split gets its own `SolaceSplitReader` and its own Solace
+flow bound to the same queue. The broker load-balances messages across all bound
+flows.
 
-**Limitation:** sentinel-based backfill detection is **automatically disabled**
-whenever `num_consumers > 1`.
-
-The sentinel mechanism works by having the operator publish a single message
-with user property `x-solace-sentinel: backfill-complete` to the queue after
-all historical data has been replayed.  That message is delivered to exactly
-one of the N consumers; the remaining N-1 readers never see it and can never
-know that backfill is complete.
-
-When `num_consumers > 1`, a received sentinel is acked and discarded with a
-`WARN`-level log line.  No backfill state is set; no readiness event is
-published.
+Because each flow receives a different subset of messages, the sentinel message
+(`x-solace-sentinel: backfill-complete`) is delivered to exactly one flow. The
+remaining N-1 readers never see it directly.
 
 ---
 
-## Option A: Shared sentinel state via checkpoint coordination
+## Cross-reader coordination via the status table
 
-**Goal:** restore sentinel-based backfill detection for `num_consumers > 1` by
-propagating the detecting reader's sentinel state to all other readers through
-the normal checkpoint/split mechanism.
+**Implemented April 2026.**
 
-### How it works
+The detecting reader runs the normal sentinel sequence:
 
-1. **Detection:** one reader (call it reader R) receives the sentinel in its
-   flow.  R sets `split.sentinel_detected = true` in the in-memory split state
-   as it does today, then calls `barrier_flush_and_status` in a spawned task.
+1. ACKs the sentinel on Solace.
+2. Spawns `barrier_flush_and_status` — issues `WAIT`, then writes `is_ready = TRUE`
+   to `rw_solace_connector_status`.
+3. Publishes the readiness event to `solace.sentinel_readiness_topic` (if configured).
 
-2. **Checkpoint propagation:** on the next RisingWave checkpoint, the framework
-   calls `SplitMetaData::encode_to_json` on each split to persist state.  R's
-   split now has `sentinel_detected: true`.  RisingWave persists this to the
-   meta store.
+All other readers learn that backfill is complete via the status table:
 
-3. **Re-enumeration:** after each checkpoint, the `SplitEnumerator::list_splits`
-   is called.  Currently it returns fresh `SolaceSplit::new(...)` objects that
-   reset all state.  **The enumerator must instead preserve in-flight sentinel
-   state from the previously assigned splits.**
+- **At startup** (`SolaceSplitReader::new()`), if `sentinel_detected = false` in the
+  checkpoint, the reader queries `rw_solace_connector_status` for its queue name.
+  If `is_ready = TRUE`, it sets `sentinel_detected = true` in memory and boots
+  directly into live mode — no barrier re-run, no duplicate readiness event.
 
-4. **State injection:** when `SplitReader::new` is called with a split that
-   already carries `sentinel_detected: true`, the reader skips re-running the
-   barrier flush (it already ran) and re-publishes the readiness event as it
-   already does on restart.
+- **On restart after the original detection**, the detecting reader's checkpoint
+  already carries `sentinel_detected = true`; it re-publishes the readiness event
+  only if `readiness_published_at` is `None` in the split state.
 
-### Required changes
+---
 
-#### `SolaceSplitEnumerator`
+## Readiness event suppression (`readiness_published_at`)
 
-The enumerator currently holds only `queue_name` and `num_consumers`; it has
-no memory of prior split state.
+`SolaceSplit` carries a `readiness_published_at: Option<String>` field. After the
+readiness event is published, this field is set to the current ISO 8601 timestamp and
+persisted in the checkpoint. On the next restart, the reader skips re-publishing if
+`readiness_published_at` is already set.
 
-New design:
+This is **best-effort**: the field is only updated through the checkpoint path when
+`SplitMetaData::update_offset` is called, which does not occur on sentinel publication.
+In practice multiple readers may all publish the readiness event on the first restart
+after sentinel detection; all publishes are idempotent for consumers.
 
-```rust
-pub struct SolaceSplitEnumerator {
-    queue_name: String,
-    num_consumers: usize,
-    /// Last-seen split state, keyed by split_id.
-    /// Populated by the framework calling assign_splits() / update with
-    /// the checkpointed splits after each barrier.
-    known_splits: HashMap<SplitId, SolaceSplit>,
-}
-```
+---
 
-`list_splits` merges: if a split ID already exists in `known_splits`, return
-the persisted split (preserving `sentinel_detected` and `sentinel_detected_at`);
-otherwise return a fresh split.
+## Duplicate sentinel resilience
 
-To receive updated split state, the enumerator needs to implement the
-`SplitEnumerator::update_with_splits` hook (or equivalent framework callback
-— check the `SplitEnumerator` trait for the exact method name in the current
-RisingWave version).
+If two messages with `x-solace-sentinel: backfill-complete` are published, the second
+sentinel will arrive at `SolaceSplitReader::into_data_stream` when `self.sentinel_detected`
+is already `true`. The reader logs a `WARN` and discards it.
 
-#### Sentinel guard in `reader.rs`
+---
 
-Remove the `num_consumers > 1` early-return guards added by Option D.  The
-normal detection path (`self.sentinel_detected` check, barrier flush spawn,
-etc.) handles all cases once the enumerator correctly forwards state.
-
-#### Readiness event coordination (optional hardening)
-
-With Option A, all N readers independently re-publish the readiness event on
-restart (because all splits carry `sentinel_detected: true` after propagation).
-This is idempotent for downstream consumers, but noisy.  To suppress redundant
-publishes, add a `readiness_published_at` field to `SolaceSplit` and only
-publish if that field is absent.
-
-### Why this is non-trivial
-
-- The `SplitEnumerator` trait in RisingWave does not currently have a
-  standardized "receive last checkpointed split states" callback in all
-  connector configurations.  You may need to thread the state through
-  the properties or through a side-channel (e.g. a shared `Arc<Mutex<...>>`
-  between the enumerator and reader factory).
-- The barrier flush task is idempotent (WAIT + upsert) so it is safe for
-  reader R to spawn it while the other N-1 readers detect `sentinel_detected =
-  true` from the next checkpoint and skip it.  The ordering guarantee is that
-  the status table is written *after* WAIT completes, regardless of which
-  reader did the detection.
-- Testing requires a real Solace broker with N flows bound; the unit-test
-  approach used for Option D is not sufficient.
-
-### Acceptance criteria
+## Acceptance criteria
 
 - `num_consumers = 4`, sentinel published once → exactly one `WAIT` issues →
-  `rw_solace_connector_status.is_ready = TRUE` → readiness event published on
-  the configured topic.
-- On connector restart with N readers and checkpointed `sentinel_detected =
-  true`, all readers boot into "live" mode without re-running WAIT.
-- Sentinel discarded with `WARN` log when `sentinel_detected` is already `true`
-  (duplicate sentinel resilience, same as today).
+  `rw_solace_connector_status.is_ready = TRUE` → readiness event published.
+- On restart with N readers and `is_ready = TRUE` in the status table, all readers
+  boot into live mode without re-running `WAIT`.
+- A duplicate sentinel is discarded with `WARN` log.

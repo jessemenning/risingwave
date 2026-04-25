@@ -1374,6 +1374,60 @@ PulsarProperties:
     field_type: bool
     required: false
     default: Default::default
+SolaceProperties:
+  fields:
+  - name: common
+    field_type: SolaceCommon
+    required: true
+  - name: solace.queue
+    field_type: String
+    comments: Solace queue name to bind to for guaranteed message consumption.
+    required: true
+  - name: solace.ack_mode
+    field_type: String
+    comments: |-
+      Acknowledgment mode: "checkpoint" (default, slower, exactly-once) or
+      "immediate" (faster, at-least-once).
+    required: false
+  - name: solace.sentinel_readiness_topic
+    field_type: String
+    comments: |-
+      Topic prefix for the readiness event published after sentinel detection.
+      The connector appends `/{queue_name}/ready` to form the full topic.
+      When unset, no readiness event is published (sentinel is still detected
+      and intercepted, but no outbound notification is sent).
+    required: false
+  - name: solace.risingwave_dsn
+    field_type: String
+    comments: |-
+      RisingWave Postgres DSN used for connector-status writes and barrier flush.
+      Defaults to `host=localhost port=4566 user=root dbname=dev connect_timeout=5`.
+    required: false
+  - name: solace.batch_size
+    field_type: usize
+    comments: |-
+      Maximum number of messages to batch per yield.
+      Defaults to 100. Higher values increase throughput at the cost of latency.
+    required: false
+  - name: solace.num_consumers
+    field_type: usize
+    comments: |-
+      Number of parallel consumers (RisingWave splits) binding to the queue.
+      Each consumer gets its own Solace flow and is assigned work by the broker's
+      built-in load balancer. Defaults to 1.
+
+      **Limitation:** sentinel-based backfill detection is automatically disabled
+      when this value is greater than 1, because a single sentinel message is
+      consumed by only one of the N readers. See PARALLEL_CONSUMERS.md for
+      the Option A roadmap to lift this restriction.
+    required: false
+  - name: solace.wait_timeout_ms
+    field_type: u64
+    comments: |-
+      Timeout in milliseconds for the RisingWave `WAIT` barrier flush command issued
+      after sentinel detection. Defaults to 60000 (60 seconds). Increase for large
+      historical backfills where materialized view catch-up may take longer.
+    required: false
 TestSourceProperties:
   fields:
   - name: properties

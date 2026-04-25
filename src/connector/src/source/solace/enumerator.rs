@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,9 +27,11 @@ use crate::source::{SourceEnumeratorContextRef, SplitEnumerator};
 /// (IDs "0" through "N-1") so RisingWave assigns one `SolaceSplitReader` per
 /// split. The Solace broker load-balances messages across all bound flows.
 ///
-/// **Sentinel limitation:** sentinel-based backfill detection is disabled for
-/// N > 1 because a single sentinel is consumed by exactly one reader. See the
-/// Option A roadmap in `src/connector/src/source/solace/docs/solace-parallel-consumers.md`.
+/// Exactly one reader will receive the sentinel message; it triggers backfill
+/// detection and writes `is_ready = true` to the `rw_solace_connector_status`
+/// table. On restart, all readers query this table at startup and boot directly
+/// into live mode if `is_ready = true`, without waiting for a sentinel they
+/// will never receive.
 #[derive(Debug)]
 pub struct SolaceSplitEnumerator {
     queue_name: String,
@@ -45,7 +47,10 @@ impl SplitEnumerator for SolaceSplitEnumerator {
         properties: Self::Properties,
         _context: SourceEnumeratorContextRef,
     ) -> ConnectorResult<Self> {
-        let num_consumers = properties.num_consumers.unwrap_or(1).max(1);
+        let num_consumers = match properties.num_consumers {
+            None | Some(1..) => properties.num_consumers.unwrap_or(1),
+            Some(0) => return Err(anyhow::anyhow!("solace.num_consumers must be >= 1").into()),
+        };
         Ok(Self {
             queue_name: properties.queue.clone(),
             num_consumers,

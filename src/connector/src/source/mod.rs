@@ -415,3 +415,61 @@ pub type CdcTableSnapshotSplitRaw = CdcTableSnapshotSplitCommon<Vec<u8>>;
 pub fn build_pulsar_ack_channel_id(source_id: SourceId, split_id: &SplitId) -> String {
     format!("{}-{}", source_id, split_id)
 }
+
+#[cfg(all(test, feature = "source-solace"))]
+mod tests {
+    use std::sync::Arc;
+
+    use risingwave_common::array::{ArrayImpl, ArrayRef, Utf8Array};
+    use risingwave_pb::id::SourceId;
+
+    use super::WaitCheckpointTask;
+    use crate::source::SplitId;
+    use crate::source::solace::source::reader::{SOLACE_ACK_CHANNEL, build_solace_ack_channel_id};
+
+    /// Traces the full checkpoint → ack path without a live Solace broker:
+    ///
+    /// 1. Reader startup: register a sender in `SOLACE_ACK_CHANNEL`.
+    /// 2. `WaitCheckpointTaskBuilder::update_task_on_chunk`: populate channel_id + offset arrays.
+    /// 3. `WaitCheckpointTask::run`: parse IDs and send through channel.
+    /// 4. Reader ack loop: drain receiver and verify correct IDs arrived.
+    ///
+    /// Also verifies that empty strings and non-numeric offsets are silently filtered
+    /// (warn-only) rather than causing a panic or sending garbage IDs.
+    #[tokio::test]
+    async fn test_checkpoint_ack_path_end_to_end() {
+        let source_id: SourceId = 99.into();
+        let split_id: SplitId = Arc::from("0");
+        let channel_id = build_solace_ack_channel_id(source_id, &split_id);
+
+        // Step 1 — reader startup: register sender.
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u64>>();
+        SOLACE_ACK_CHANNEL
+            .entry(channel_id.clone())
+            .and_upsert_with(|_| std::future::ready(ack_tx))
+            .await;
+
+        // Step 2 — simulate update_task_on_chunk: build offset arrays.
+        // Good IDs: 101, 202. Also include an empty string and a non-numeric string
+        // to verify the warn-and-skip path in the execute logic.
+        let arr: ArrayRef = Arc::new(ArrayImpl::Utf8(Utf8Array::from_iter([
+            Some("101"),
+            Some(""),
+            Some("bogus"),
+            Some("202"),
+        ])));
+        let task = WaitCheckpointTask::AckSolaceMessage(channel_id, vec![arr]);
+
+        // Step 3 — checkpoint fires: task parses IDs and sends through channel.
+        task.run(source_id, "test-source").await;
+
+        // Step 4 — reader ack loop: drain receiver.
+        let received = ack_rx.try_recv().expect("ack channel should have one batch");
+
+        // Only the two valid IDs should arrive; empty string and "bogus" are dropped.
+        assert_eq!(received, vec![101u64, 202u64]);
+
+        // No second batch should be pending.
+        assert!(ack_rx.try_recv().is_err(), "only one batch expected");
+    }
+}

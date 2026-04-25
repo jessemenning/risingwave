@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,7 +25,18 @@ use crate::source::{SplitId, SplitMetaData};
 pub struct SolaceSplit {
     pub(crate) queue_name: String,
     pub(crate) split_id: SplitId,
-    /// Last seen message ID, used for offset tracking.
+    /// Last-seen Solace message ID (stored as a decimal string).
+    ///
+    /// This field is updated by the framework via `update_offset` after each message is
+    /// processed. It is NOT used to seek the queue position on reconnect — queue-backed
+    /// connectors rely on broker-side acking: the Solace broker tracks which messages have
+    /// been acked per client flow and automatically re-delivers unacked messages after a
+    /// reconnect, regardless of where the consumer left off.
+    ///
+    /// The field IS used by the checkpoint-ack path: the framework propagates `start_offset`
+    /// into `WaitCheckpointTask::AckSolaceMessage` as the offset column, and at checkpoint
+    /// the task parses it back to `u64` and sends the IDs through `SOLACE_ACK_CHANNEL` so
+    /// the reader can call `flow.ack()` after the checkpoint barrier clears.
     pub(crate) start_offset: Option<String>,
     /// Whether the backfill sentinel was detected. When `true`, the connector
     /// is in live mode and will re-publish the readiness event on restart.
@@ -34,6 +45,12 @@ pub struct SolaceSplit {
     /// ISO 8601 timestamp of when the sentinel was first detected.
     #[serde(default)]
     pub(crate) sentinel_detected_at: Option<String>,
+    /// ISO 8601 timestamp of when this reader last published the readiness
+    /// event. `None` means the readiness event has not yet been published by
+    /// this split's reader. Used to suppress redundant re-publishes on restart
+    /// when multiple readers all boot into live mode simultaneously.
+    #[serde(default)]
+    pub(crate) readiness_published_at: Option<String>,
 }
 
 impl SplitMetaData for SolaceSplit {
@@ -63,6 +80,7 @@ impl SolaceSplit {
             start_offset: None,
             sentinel_detected: false,
             sentinel_detected_at: None,
+            readiness_published_at: None,
         }
     }
 }
@@ -125,6 +143,7 @@ mod test {
             start_offset: Some("42".to_owned()),
             sentinel_detected: true,
             sentinel_detected_at: Some("2026-04-13T12:00:00Z".to_owned()),
+            readiness_published_at: None,
         };
 
         let encoded = split.encode_to_json();
@@ -148,8 +167,28 @@ mod test {
         let split: SolaceSplit = serde_json::from_value(old_json).unwrap();
         assert_eq!(split.queue_name, "legacy-queue");
         assert_eq!(split.start_offset, Some("999".to_owned()));
-        // Sentinel fields default to false / None thanks to #[serde(default)]
+        // All optional fields default via #[serde(default)]
         assert!(!split.sentinel_detected);
         assert_eq!(split.sentinel_detected_at, None);
+        assert_eq!(split.readiness_published_at, None);
+    }
+
+    #[test]
+    fn test_split_encode_decode_with_readiness_published_at() {
+        let split = SolaceSplit {
+            queue_name: "rw-ingest".to_owned(),
+            split_id: Arc::from("0"),
+            start_offset: Some("42".to_owned()),
+            sentinel_detected: true,
+            sentinel_detected_at: Some("2026-04-25T10:00:00Z".to_owned()),
+            readiness_published_at: Some("2026-04-25T10:00:05Z".to_owned()),
+        };
+        let encoded = split.encode_to_json();
+        let decoded = SolaceSplit::restore_from_json(encoded).unwrap();
+        assert_eq!(split, decoded);
+        assert_eq!(
+            decoded.readiness_published_at,
+            Some("2026-04-25T10:00:05Z".to_owned())
+        );
     }
 }

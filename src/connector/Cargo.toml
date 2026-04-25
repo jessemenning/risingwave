@@ -49,6 +49,8 @@ async-nats = { version = "0.46", features = ["websockets"] }
 async-trait = "0.1"
 auto_enums = { workspace = true }
 auto_impl = "1"
+bb8 = { workspace = true }
+bb8-postgres = { workspace = true }
 await-tree = { workspace = true }
 aws-config = { workspace = true }
 aws-credential-types = { workspace = true }
@@ -254,6 +256,11 @@ harness = false
 [[bench]]
 name = "protobuf_bench"
 harness = false
+
+[[test]]
+name = "solace_integration"
+path = "tests/solace_integration.rs"
+required-features = ["source-solace", "sink-solace"]
 
 [lints]
 workspace = true
