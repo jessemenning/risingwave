@@ -52,6 +52,7 @@ use solace_rs::message::{DeliveryMode, DestinationType, Message, MessageDestinat
 use solace_rs::SolaceLogLevel;
 use solace_rs::context::Context;
 use solace_rs::async_support::AsyncSessionBuilder;
+use solace_rs::SessionError;
 
 /// Host-side broker URL (docker-compose maps host 55554 → broker 55555).
 const BROKER_URL: &str = "tcp://localhost:55554";
@@ -360,5 +361,306 @@ async fn test_sink_direct_publish() {
     assert_eq!(
         received.get_payload().unwrap().unwrap(),
         b"direct-sink-payload"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Persistent publish with broker ACK
+//    (exercises the sink connector's publish_with_ack path)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn test_persistent_publish_with_ack() {
+    let ctx = Context::new(SolaceLogLevel::Warning).unwrap();
+    let session = AsyncSessionBuilder::new(&ctx)
+        .host_name(BROKER_URL)
+        .vpn_name(BROKER_VPN)
+        .username(BROKER_USER)
+        .password(BROKER_PASS)
+        .build()
+        .expect("session");
+
+    let dest = MessageDestination::new(DestinationType::Queue, TEST_QUEUE).unwrap();
+    let msg = OutboundMessageBuilder::new()
+        .destination(dest)
+        .delivery_mode(DeliveryMode::Persistent)
+        .payload(b"persistent-with-ack" as &[u8])
+        .build()
+        .unwrap();
+
+    let ack_future = session
+        .publish_with_ack(msg)
+        .expect("publish_with_ack returned Err — check broker connectivity");
+
+    let ack_result: Result<(), SessionError> = tokio::time::timeout(RECV_TIMEOUT, ack_future)
+        .await
+        .expect("timed out waiting for broker ACK")
+        .expect("ACK channel closed before broker responded");
+
+    assert!(ack_result.is_ok(), "broker rejected persistent message: {:?}", ack_result);
+
+    // Drain the message we just spooled.
+    let mut flow = session.create_flow(TEST_QUEUE, AckMode::Auto).expect("drain flow");
+    let _ = tokio::time::timeout(RECV_TIMEOUT, flow.recv())
+        .await
+        .expect("drain timed out");
+}
+
+// ---------------------------------------------------------------------------
+// 8. NonPersistent publish via topic subscription
+//    (exercises the NonPersistent branch in the sink's delivery mode logic)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn test_non_persistent_publish_and_receive() {
+    let topic = "rw/integration/sink/nonpersistent";
+
+    let ctx = Context::new(SolaceLogLevel::Warning).unwrap();
+
+    let mut sub_session = AsyncSessionBuilder::new(&ctx)
+        .host_name(BROKER_URL)
+        .vpn_name(BROKER_VPN)
+        .username(BROKER_USER)
+        .password(BROKER_PASS)
+        .build()
+        .expect("subscriber session");
+    sub_session.subscribe(topic).expect("subscribe");
+    tokio::time::sleep(SLEEP_TIME).await;
+
+    let pub_session = AsyncSessionBuilder::new(&ctx)
+        .host_name(BROKER_URL)
+        .vpn_name(BROKER_VPN)
+        .username(BROKER_USER)
+        .password(BROKER_PASS)
+        .build()
+        .expect("publisher session");
+
+    let dest = MessageDestination::new(DestinationType::Topic, topic).unwrap();
+    let msg = OutboundMessageBuilder::new()
+        .destination(dest)
+        .delivery_mode(DeliveryMode::NonPersistent)
+        .payload(b"nonpersistent-payload" as &[u8])
+        .build()
+        .unwrap();
+
+    let ack_future = pub_session
+        .publish_with_ack(msg)
+        .expect("publish_with_ack failed");
+
+    // Await the broker ACK for the NonPersistent send.
+    let ack_result: Result<(), SessionError> = tokio::time::timeout(RECV_TIMEOUT, ack_future)
+        .await
+        .expect("timed out waiting for NonPersistent ACK")
+        .expect("ACK channel closed");
+    assert!(ack_result.is_ok(), "broker rejected NonPersistent message: {:?}", ack_result);
+
+    let received = tokio::time::timeout(RECV_TIMEOUT, sub_session.recv())
+        .await
+        .expect("timed out waiting for NonPersistent message")
+        .expect("channel closed");
+
+    assert_eq!(
+        received.get_payload().unwrap().unwrap(),
+        b"nonpersistent-payload"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. Batch receive via try_recv
+//    (exercises the non-blocking poll path used by the source's batch-fill loop)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn test_batch_messages_received_via_try_recv() {
+    let ctx = Context::new(SolaceLogLevel::Warning).unwrap();
+    let session = AsyncSessionBuilder::new(&ctx)
+        .host_name(BROKER_URL)
+        .vpn_name(BROKER_VPN)
+        .username(BROKER_USER)
+        .password(BROKER_PASS)
+        .build()
+        .expect("session");
+
+    // Publish 5 persistent messages.
+    for i in 0u8..5 {
+        let dest = MessageDestination::new(DestinationType::Queue, TEST_QUEUE).unwrap();
+        let payload = format!("batch-msg-{i}");
+        let msg = OutboundMessageBuilder::new()
+            .destination(dest)
+            .delivery_mode(DeliveryMode::Persistent)
+            .payload(payload.as_bytes())
+            .build()
+            .unwrap();
+        session.publish(msg).expect("publish");
+    }
+
+    // Give the broker a moment to spool all 5 before binding a flow.
+    tokio::time::sleep(SLEEP_TIME).await;
+
+    let mut flow = session
+        .create_flow(TEST_QUEUE, AckMode::Auto)
+        .expect("create_flow");
+
+    // Receive the first message via blocking recv to ensure the queue is non-empty.
+    let first = tokio::time::timeout(RECV_TIMEOUT, flow.recv())
+        .await
+        .expect("timed out waiting for first message")
+        .expect("channel closed");
+    assert!(first.get_payload().unwrap().unwrap().starts_with(b"batch-msg-"));
+
+    // Drain the remaining 4 via try_recv (non-blocking).
+    let mut count = 1usize;
+    tokio::time::sleep(SLEEP_TIME).await;
+    while flow.try_recv().is_ok() {
+        count += 1;
+    }
+    assert_eq!(count, 5, "expected 5 messages, got {count}");
+}
+
+// ---------------------------------------------------------------------------
+// 10. Unacked message redelivery flag
+//     (verifies is_redelivered() and SolaceMessage::redelivered field)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn test_unacked_message_redelivered_flag() {
+    let ctx = Context::new(SolaceLogLevel::Warning).unwrap();
+    let session = AsyncSessionBuilder::new(&ctx)
+        .host_name(BROKER_URL)
+        .vpn_name(BROKER_VPN)
+        .username(BROKER_USER)
+        .password(BROKER_PASS)
+        .build()
+        .expect("session");
+
+    let dest = MessageDestination::new(DestinationType::Queue, TEST_QUEUE).unwrap();
+    let msg = OutboundMessageBuilder::new()
+        .destination(dest)
+        .delivery_mode(DeliveryMode::Persistent)
+        .payload(b"redeliver-test" as &[u8])
+        .build()
+        .unwrap();
+    session.publish(msg).expect("publish");
+
+    // Receive without acking, then drop the flow — broker requeues the message.
+    {
+        let mut flow = session
+            .create_flow(TEST_QUEUE, AckMode::Client)
+            .expect("create_flow");
+        let received = tokio::time::timeout(RECV_TIMEOUT, flow.recv())
+            .await
+            .expect("timed out waiting for first delivery")
+            .expect("channel closed");
+        assert_eq!(received.get_payload().unwrap().unwrap(), b"redeliver-test");
+        // Drop without acking — flow destructor returns message to queue.
+    }
+
+    // Give the broker a moment to redeliver.
+    tokio::time::sleep(SLEEP_TIME).await;
+
+    let mut flow2 = session
+        .create_flow(TEST_QUEUE, AckMode::Auto)
+        .expect("create_flow 2");
+
+    let redelivered = tokio::time::timeout(RECV_TIMEOUT, flow2.recv())
+        .await
+        .expect("timed out waiting for redelivered message")
+        .expect("channel closed");
+
+    assert!(
+        redelivered.is_redelivered(),
+        "broker must set the redelivered flag on the second delivery"
+    );
+
+    let split_id: Arc<str> = Arc::from("test-split-0");
+    let solace_msg = SolaceMessage::from_inbound(&redelivered, split_id);
+    assert!(
+        solace_msg.redelivered,
+        "SolaceMessage::redelivered must be true when broker sets the flag"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. Readiness event topic roundtrip
+//     (verifies the x-risingwave-event user property path used by the source)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn test_readiness_event_topic_roundtrip() {
+    let topic = "rw/integration/connector/ready";
+
+    let ctx = Context::new(SolaceLogLevel::Warning).unwrap();
+
+    let mut sub_session = AsyncSessionBuilder::new(&ctx)
+        .host_name(BROKER_URL)
+        .vpn_name(BROKER_VPN)
+        .username(BROKER_USER)
+        .password(BROKER_PASS)
+        .build()
+        .expect("subscriber session");
+    sub_session.subscribe(topic).expect("subscribe");
+    tokio::time::sleep(SLEEP_TIME).await;
+
+    let pub_session = AsyncSessionBuilder::new(&ctx)
+        .host_name(BROKER_URL)
+        .vpn_name(BROKER_VPN)
+        .username(BROKER_USER)
+        .password(BROKER_PASS)
+        .build()
+        .expect("publisher session");
+
+    let payload = br#"{"queue":"rw-integration-test-queue","status":"ready"}"#;
+    let dest = MessageDestination::new(DestinationType::Topic, topic).unwrap();
+    let msg = OutboundMessageBuilder::new()
+        .destination(dest)
+        .delivery_mode(DeliveryMode::Direct)
+        .payload(payload as &[u8])
+        .user_property("x-risingwave-event", "connector-ready")
+        .build()
+        .unwrap();
+    pub_session.publish(msg).expect("publish readiness event");
+
+    let received = tokio::time::timeout(RECV_TIMEOUT, sub_session.recv())
+        .await
+        .expect("timed out waiting for readiness event")
+        .expect("channel closed");
+
+    assert_eq!(received.get_payload().unwrap().unwrap(), payload.as_ref());
+
+    let user_props = received.get_user_properties().unwrap_or_default();
+    assert_eq!(
+        user_props.get("x-risingwave-event").map(|s| s.as_str()),
+        Some("connector-ready"),
+        "x-risingwave-event user property must be present and correct"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12. Connection failure — wrong port / bad URL returns Err
+//     (verifies SolaceCommon::build_async_session fails gracefully)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn test_connection_failure_bad_url() {
+    let common: SolaceCommon = serde_json::from_value(serde_json::json!({
+        "solace.url":              "tcp://localhost:55553",
+        "solace.vpn_name":         BROKER_VPN,
+        "solace.username":         BROKER_USER,
+        "solace.password":         BROKER_PASS,
+        "solace.connect_timeout_ms": "1000",
+        "solace.reconnect_retries":  "0",
+    }))
+    .expect("deserialization failed");
+
+    let result = common.build_async_session(None);
+    assert!(
+        result.is_err(),
+        "connection to wrong port must return Err, but got Ok"
     );
 }

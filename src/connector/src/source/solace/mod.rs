@@ -238,6 +238,13 @@ mod test {
     }
 
     #[test]
+    fn test_parse_solace_ack_mode_empty_string_error() {
+        // An empty string is not a valid ack mode — must not silently default to checkpoint.
+        let result = SolaceAckMode::from_str_opt(Some(""));
+        assert!(result.is_err(), "empty string should be rejected as an invalid ack mode");
+    }
+
+    #[test]
     fn test_parse_sentinel_readiness_topic() {
         let config: BTreeMap<String, String> = btreemap! {
             "solace.url".to_owned() => "tcp://localhost:55555".to_owned(),

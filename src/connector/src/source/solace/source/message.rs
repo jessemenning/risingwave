@@ -270,6 +270,8 @@ impl From<SolaceMessage> for SourceMessage {
 mod test {
     use std::sync::Arc;
 
+    use risingwave_common::types::{ScalarRefImpl, Timestamptz};
+
     use super::*;
 
     fn make_msg(destination: Option<&str>) -> SolaceMessage {
@@ -452,5 +454,115 @@ mod test {
         );
         assert!(msg.is_sentinel());
         assert!(!msg.payload.is_empty());
+    }
+
+    // ── SolaceMeta extract_* method tests ───────────────────────────────
+
+    fn make_meta_full() -> SolaceMeta {
+        let ts = Timestamptz::from_millis(1_700_000_000_000).unwrap();
+        SolaceMeta {
+            destination: Some("topic/orders".to_owned()),
+            sender_timestamp: Some(ts),
+            replication_group_message_id: Some("RGMID-XYZ".to_owned()),
+            correlation_id: Some("corr-42".to_owned()),
+            sequence_number: Some(7),
+            priority: Some(3),
+            redelivered: true,
+            application_message_id: Some("app-id-1".to_owned()),
+            expiration: Some(ts),
+            reply_to: Some("reply/topic".to_owned()),
+        }
+    }
+
+    #[test]
+    fn test_solace_meta_extract_all_methods() {
+        let meta = make_meta_full();
+
+        assert!(
+            matches!(meta.extract_destination(), Some(ScalarRefImpl::Utf8("topic/orders"))),
+            "destination extractor"
+        );
+        assert!(
+            matches!(meta.extract_sender_timestamp(), Some(ScalarRefImpl::Timestamptz(_))),
+            "sender_timestamp extractor"
+        );
+        assert!(
+            matches!(
+                meta.extract_replication_group_message_id(),
+                Some(ScalarRefImpl::Utf8("RGMID-XYZ"))
+            ),
+            "replication_group_message_id extractor"
+        );
+        assert!(
+            matches!(meta.extract_correlation_id(), Some(ScalarRefImpl::Utf8("corr-42"))),
+            "correlation_id extractor"
+        );
+        assert!(
+            matches!(meta.extract_sequence_number(), Some(ScalarRefImpl::Int64(7))),
+            "sequence_number extractor"
+        );
+        assert!(
+            matches!(meta.extract_priority(), Some(ScalarRefImpl::Int32(3))),
+            "priority extractor"
+        );
+        assert!(
+            matches!(meta.extract_redelivered(), ScalarRefImpl::Bool(true)),
+            "redelivered extractor"
+        );
+        assert!(
+            matches!(
+                meta.extract_application_message_id(),
+                Some(ScalarRefImpl::Utf8("app-id-1"))
+            ),
+            "application_message_id extractor"
+        );
+        assert!(
+            matches!(meta.extract_expiration(), Some(ScalarRefImpl::Timestamptz(_))),
+            "expiration extractor"
+        );
+        assert!(
+            matches!(meta.extract_reply_to(), Some(ScalarRefImpl::Utf8("reply/topic"))),
+            "reply_to extractor"
+        );
+    }
+
+    #[test]
+    fn test_solace_meta_extract_none_fields() {
+        let meta = SolaceMeta {
+            destination: None,
+            sender_timestamp: None,
+            replication_group_message_id: None,
+            correlation_id: None,
+            sequence_number: None,
+            priority: None,
+            redelivered: false,
+            application_message_id: None,
+            expiration: None,
+            reply_to: None,
+        };
+
+        assert!(meta.extract_destination().is_none(), "destination should be None");
+        assert!(
+            meta.extract_sender_timestamp().is_none(),
+            "sender_timestamp should be None"
+        );
+        assert!(
+            meta.extract_replication_group_message_id().is_none(),
+            "replication_group_message_id should be None"
+        );
+        assert!(meta.extract_correlation_id().is_none(), "correlation_id should be None");
+        assert!(meta.extract_sequence_number().is_none(), "sequence_number should be None");
+        assert!(meta.extract_priority().is_none(), "priority should be None");
+        // redelivered is a plain bool — always returns a value (false when not redelivered).
+        assert!(
+            matches!(meta.extract_redelivered(), ScalarRefImpl::Bool(false)),
+            "redelivered should be false"
+        );
+        assert!(
+            meta.extract_application_message_id().is_none(),
+            "application_message_id should be None"
+        );
+        assert!(meta.extract_expiration().is_none(), "expiration should be None");
+        assert!(meta.extract_reply_to().is_none(), "reply_to should be None");
     }
 }

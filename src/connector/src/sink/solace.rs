@@ -752,9 +752,11 @@ impl AsyncTruncateSinkWriter for SolaceSinkWriter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use risingwave_common::array::{DataChunk, DataChunkTestExt};
     use risingwave_common::catalog::{Field, Schema};
-    use risingwave_common::types::DataType;
+    use risingwave_common::types::{DataType, ScalarRefImpl};
 
     use super::*;
 
@@ -1150,5 +1152,147 @@ mod tests {
         filter.should_emit(row); // first rotation: key moves to prev
         std::thread::sleep(Duration::from_millis(6));
         assert!(filter.should_emit(row), "key should re-emit after full window expires");
+    }
+
+    #[test]
+    fn test_topic_template_pure_literal() {
+        let schema = schema_varchar_int();
+        let tmpl =
+            TopicTemplate::parse("just/a/literal/topic", &schema, NullTopicBehavior::Error)
+                .unwrap();
+
+        let chunk = DataChunk::from_pretty(
+            "T i
+             US 200",
+        );
+        let row = chunk.row_at(0).0;
+        let topic = tmpl.render(row).unwrap().unwrap();
+        assert_eq!(topic, "just/a/literal/topic");
+    }
+
+    #[test]
+    fn test_topic_template_consecutive_placeholders() {
+        let schema = schema_two_varchar();
+        let tmpl =
+            TopicTemplate::parse("{col_a}{col_b}", &schema, NullTopicBehavior::Error).unwrap();
+
+        let chunk = DataChunk::from_pretty(
+            "T T
+             hello world",
+        );
+        let row = chunk.row_at(0).0;
+        let topic = tmpl.render(row).unwrap().unwrap();
+        assert_eq!(topic, "helloworld");
+    }
+
+    #[test]
+    fn test_scalar_to_topic_segment_numeric_and_bool() {
+        assert_eq!(
+            scalar_to_topic_segment(ScalarRefImpl::Int32(42)).unwrap(),
+            "42"
+        );
+        assert_eq!(
+            scalar_to_topic_segment(ScalarRefImpl::Int64(9_876_543_210)).unwrap(),
+            "9876543210"
+        );
+        assert_eq!(
+            scalar_to_topic_segment(ScalarRefImpl::Int16(7)).unwrap(),
+            "7"
+        );
+        assert_eq!(
+            scalar_to_topic_segment(ScalarRefImpl::Bool(true)).unwrap(),
+            "true"
+        );
+        assert_eq!(
+            scalar_to_topic_segment(ScalarRefImpl::Bool(false)).unwrap(),
+            "false"
+        );
+    }
+
+    #[test]
+    fn test_dedup_filter_multi_column_key() {
+        let schema = schema_two_varchar();
+        let mut filter =
+            DedupFilter::new("col_a,col_b", Duration::from_secs(300), &schema).unwrap();
+
+        let chunk1 = DataChunk::from_pretty(
+            "T T
+             foo bar",
+        );
+        let chunk2 = DataChunk::from_pretty(
+            "T T
+             foo baz",
+        );
+
+        let row1 = chunk1.row_at(0).0;
+        let row2 = chunk2.row_at(0).0;
+
+        // (foo, bar) and (foo, baz) differ only in second column — both should emit.
+        assert!(filter.should_emit(row1), "(foo,bar) should emit");
+        assert!(
+            filter.should_emit(row2),
+            "(foo,baz) should emit — different second column"
+        );
+
+        // Both are suppressed on repeat within the window.
+        assert!(!filter.should_emit(row1));
+        assert!(!filter.should_emit(row2));
+    }
+
+    #[test]
+    fn test_dedup_filter_null_column_in_key() {
+        let schema = schema_two_varchar();
+        let mut filter =
+            DedupFilter::new("col_a,col_b", Duration::from_secs(300), &schema).unwrap();
+
+        // NULL second column — serialized as JSON null, must not collide with "bar".
+        let chunk_null = DataChunk::from_pretty(
+            "T T
+             foo .",
+        );
+        let chunk_value = DataChunk::from_pretty(
+            "T T
+             foo bar",
+        );
+
+        let row_null = chunk_null.row_at(0).0;
+        let row_value = chunk_value.row_at(0).0;
+
+        assert!(filter.should_emit(row_null), "(foo, NULL) should emit first time");
+        assert!(
+            filter.should_emit(row_value),
+            "(foo, bar) should emit — not same key as (foo, NULL)"
+        );
+
+        // Each is suppressed on repeat.
+        assert!(!filter.should_emit(row_null));
+        assert!(!filter.should_emit(row_value));
+    }
+
+    #[test]
+    fn test_solace_config_non_append_only_rejected() {
+        let mut map = BTreeMap::new();
+        map.insert("solace.url".to_owned(), "tcp://localhost:55555".to_owned());
+        map.insert("solace.topic".to_owned(), "test/topic".to_owned());
+        map.insert("type".to_owned(), "upsert".to_owned());
+
+        let err = SolaceConfig::from_btreemap(map).unwrap_err();
+        assert!(
+            format!("{err}").contains("append-only"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_null_topic_behavior_replace_empty() {
+        // "replace:" with nothing after the colon → Replace("") is valid.
+        let result = parse_null_topic_behavior("replace:").unwrap();
+        assert!(matches!(result, NullTopicBehavior::Replace(v) if v.is_empty()));
+    }
+
+    #[test]
+    fn test_parse_duration_zero() {
+        assert_eq!(parse_duration("0").unwrap(), Duration::from_secs(0));
+        assert_eq!(parse_duration("0s").unwrap(), Duration::from_secs(0));
     }
 }
