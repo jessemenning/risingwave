@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
@@ -75,12 +75,31 @@ pub struct SolaceConfig {
     #[serde(rename = "solace.dedup_window")]
     pub dedup_window: Option<String>,
 
+    /// How to handle a NULL column value when rendering the topic template.
+    /// - `"error"` (default): return an error and fail the row
+    /// - `"skip"`: silently drop the row without publishing
+    /// - `"replace:<value>"`: substitute a literal string for the NULL segment
+    #[serde(rename = "solace.null_topic_behavior", default = "default_null_topic_behavior")]
+    pub null_topic_behavior: String,
+
+    /// Maximum payload size in bytes. Messages exceeding this limit are dropped
+    /// with a warning instead of being sent. Useful for avoiding broker rejections
+    /// when the Solace broker max message size is below the default 10 MB (10485760).
+    /// When unset, no size limit is enforced.
+    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
+    #[serde(rename = "solace.max_message_bytes")]
+    pub max_message_bytes: Option<usize>,
+
     // accept "append-only"
     pub r#type: String,
 }
 
 fn default_delivery_mode() -> String {
     "direct".to_owned()
+}
+
+fn default_null_topic_behavior() -> String {
+    "error".to_owned()
 }
 
 impl SolaceConfig {
@@ -97,6 +116,37 @@ impl SolaceConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Null topic behavior
+// ---------------------------------------------------------------------------
+
+/// Policy for handling NULL column values when rendering the topic template.
+#[derive(Debug, Clone)]
+enum NullTopicBehavior {
+    /// Return an error — the write fails for the affected row (default).
+    Error,
+    /// Silently skip the row without publishing a message.
+    Skip,
+    /// Substitute a literal replacement string for the NULL topic segment.
+    Replace(String),
+}
+
+fn parse_null_topic_behavior(s: &str) -> Result<NullTopicBehavior> {
+    if s == "error" {
+        return Ok(NullTopicBehavior::Error);
+    }
+    if s == "skip" {
+        return Ok(NullTopicBehavior::Skip);
+    }
+    if let Some(val) = s.strip_prefix("replace:") {
+        return Ok(NullTopicBehavior::Replace(val.to_owned()));
+    }
+    Err(SinkError::Config(anyhow!(
+        "invalid solace.null_topic_behavior '{}', expected 'error', 'skip', or 'replace:<value>'",
+        s
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // Topic template
 // ---------------------------------------------------------------------------
 
@@ -109,10 +159,11 @@ enum Segment {
 #[derive(Debug)]
 struct TopicTemplate {
     segments: Vec<Segment>,
+    null_behavior: NullTopicBehavior,
 }
 
 impl TopicTemplate {
-    fn parse(template: &str, schema: &Schema) -> Result<Self> {
+    fn parse(template: &str, schema: &Schema, null_behavior: NullTopicBehavior) -> Result<Self> {
         let mut segments = Vec::new();
         let mut remaining = template;
 
@@ -147,23 +198,34 @@ impl TopicTemplate {
             }
         }
 
-        Ok(Self { segments })
+        Ok(Self { segments, null_behavior })
     }
 
-    fn render(&self, row: impl Row) -> Result<String> {
+    /// Renders the topic string for `row`.
+    ///
+    /// Returns `Ok(None)` when a column is NULL and `null_behavior` is `Skip`.
+    /// Returns `Ok(Some(topic))` on success.
+    /// Returns `Err` when `null_behavior` is `Error` and a NULL is encountered, or on other errors.
+    fn render(&self, row: impl Row) -> Result<Option<String>> {
         let mut out = String::new();
         for seg in &self.segments {
             match seg {
                 Segment::Literal(s) => out.push_str(s),
                 Segment::Column { index } => {
                     let datum = row.datum_at(*index);
-                    let scalar = datum.ok_or_else(|| {
-                        SinkError::Solace(anyhow!(
-                            "NULL value in topic template column index {}",
-                            index
-                        ))
-                    })?;
-                    let s = scalar_to_topic_segment(scalar)?;
+                    let s = match datum {
+                        Some(scalar) => scalar_to_topic_segment(scalar)?,
+                        None => match &self.null_behavior {
+                            NullTopicBehavior::Error => {
+                                return Err(SinkError::Solace(anyhow!(
+                                    "NULL value in topic template column index {}",
+                                    index
+                                )));
+                            }
+                            NullTopicBehavior::Skip => return Ok(None),
+                            NullTopicBehavior::Replace(val) => val.clone(),
+                        },
+                    };
                     if s.contains('/') {
                         return Err(SinkError::Solace(anyhow!(
                             "topic segment value '{}' contains '/' which is not allowed",
@@ -174,7 +236,7 @@ impl TopicTemplate {
                 }
             }
         }
-        Ok(out)
+        Ok(Some(out))
     }
 }
 
@@ -196,6 +258,23 @@ fn scalar_to_topic_segment(scalar: ScalarRefImpl<'_>) -> Result<String> {
     }
 }
 
+/// Converts a scalar to its string representation for use as a dedup key component.
+/// Returns a consistent, locale-invariant string for all supported types.
+fn scalar_for_dedup_key(scalar: ScalarRefImpl<'_>) -> String {
+    match scalar {
+        ScalarRefImpl::Utf8(s) => s.to_owned(),
+        ScalarRefImpl::Int16(v) => v.to_string(),
+        ScalarRefImpl::Int32(v) => v.to_string(),
+        ScalarRefImpl::Int64(v) => v.to_string(),
+        ScalarRefImpl::Float32(v) => v.0.to_string(),
+        ScalarRefImpl::Float64(v) => v.0.to_string(),
+        ScalarRefImpl::Bool(v) => v.to_string(),
+        ScalarRefImpl::Decimal(v) => v.to_string(),
+        ScalarRefImpl::Serial(v) => v.as_row_id().to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dedup filter
 // ---------------------------------------------------------------------------
@@ -209,14 +288,26 @@ struct DedupFilter {
 
 impl DedupFilter {
     fn new(dedup_key: &str, window: Duration, schema: &Schema) -> Result<Self> {
-        let indices: Result<Vec<usize>> = dedup_key
-            .split(',')
+        let col_names: Vec<&str> = dedup_key.split(',').map(|c| c.trim()).collect();
+
+        // Reject duplicate column names up front.
+        let mut seen = HashSet::new();
+        for col in &col_names {
+            if !seen.insert(*col) {
+                return Err(SinkError::Config(anyhow!(
+                    "solace.dedup_key contains duplicate column '{}'",
+                    col
+                )));
+            }
+        }
+
+        let indices: Result<Vec<usize>> = col_names
+            .iter()
             .map(|col| {
-                let col = col.trim();
                 schema
                     .fields()
                     .iter()
-                    .position(|f| f.name == col)
+                    .position(|f| f.name == *col)
                     .ok_or_else(|| {
                         SinkError::Config(anyhow!(
                             "solace.dedup_key column '{}' not found in schema",
@@ -233,11 +324,18 @@ impl DedupFilter {
     }
 
     fn build_key(&self, row: impl Row) -> String {
-        self.key_col_indices
+        // Serialize as a JSON array to prevent key collisions when column values contain
+        // characters that would otherwise be confused with the key separator.
+        // serde_json handles string escaping, making ("a|b","c") != ("a","b|c").
+        let values: Vec<serde_json::Value> = self
+            .key_col_indices
             .iter()
-            .map(|&i| format!("{:?}", row.datum_at(i)))
-            .collect::<Vec<_>>()
-            .join("|")
+            .map(|&i| match row.datum_at(i) {
+                None => serde_json::Value::Null,
+                Some(s) => serde_json::Value::String(scalar_for_dedup_key(s)),
+            })
+            .collect();
+        serde_json::to_string(&values).unwrap_or_default()
     }
 
     fn should_emit(&mut self, row: impl Row) -> bool {
@@ -326,6 +424,10 @@ fn build_json_encoder(schema: &Schema, format_desc: &SinkFormatDesc) -> Result<J
             SinkEncode::Json => Ok(JsonEncoder::new(
                 schema.clone(),
                 None,
+                // DateHandlingMode::FromCe: dates are emitted as integer days since the
+                // Common Era epoch (0001-01-01). TimestampHandlingMode::Milli: timestamps
+                // are emitted as milliseconds since Unix epoch. These choices are intentional
+                // and documented in the Solace connector reference.
                 DateHandlingMode::FromCe,
                 TimestampHandlingMode::Milli,
                 timestamptz_mode,
@@ -396,8 +498,11 @@ impl Sink for SolaceSink {
             )));
         }
 
+        // Validate null_topic_behavior before parsing the template (it's needed for parse).
+        let null_behavior = parse_null_topic_behavior(&self.config.null_topic_behavior)?;
+
         // Validate topic template column references.
-        TopicTemplate::parse(&self.config.topic_template, &self.schema)?;
+        TopicTemplate::parse(&self.config.topic_template, &self.schema, null_behavior)?;
 
         // Validate delivery mode string.
         parse_delivery_mode(&self.config.delivery_mode)?;
@@ -442,13 +547,14 @@ impl Sink for SolaceSink {
 // ---------------------------------------------------------------------------
 
 pub struct SolaceSinkWriter {
-    // Context must be stored to keep the C-level context alive for the session's duration.
+    // held alive for C FFI: session borrows context's C-level handle
     _context: Context,
     session: solace_rs::async_support::AsyncSession,
     topic_template: TopicTemplate,
     delivery_mode: SolaceDeliveryMode,
     encoder: JsonEncoder,
     dedup_filter: Option<DedupFilter>,
+    max_message_bytes: Option<usize>,
 }
 
 impl SolaceSinkWriter {
@@ -458,9 +564,11 @@ impl SolaceSinkWriter {
         format_desc: &SinkFormatDesc,
         name: &str,
     ) -> Result<Self> {
-        let topic_template = TopicTemplate::parse(&config.topic_template, &schema)?;
+        let null_behavior = parse_null_topic_behavior(&config.null_topic_behavior)?;
+        let topic_template = TopicTemplate::parse(&config.topic_template, &schema, null_behavior)?;
         let delivery_mode = parse_delivery_mode(&config.delivery_mode)?;
         let encoder = build_json_encoder(&schema, format_desc)?;
+        let max_message_bytes = config.max_message_bytes;
 
         let dedup_filter = if let Some(ref key) = config.dedup_key {
             let window_str = config.dedup_window.as_deref().ok_or_else(|| {
@@ -486,11 +594,18 @@ impl SolaceSinkWriter {
             delivery_mode,
             encoder,
             dedup_filter,
+            max_message_bytes,
         })
     }
 }
 
 impl AsyncTruncateSinkWriter for SolaceSinkWriter {
+    // NOTE: _add_future is intentionally unused. Solace publish() is fire-and-forget —
+    // no broker-side delivery confirmation is awaited. For direct and non_persistent
+    // modes this is by design. For persistent mode, the broker ACK is not tracked by
+    // this connector, so RisingWave considers a chunk successful as soon as publish()
+    // returns without a session error. If confirmed delivery semantics are required,
+    // the publish future must be wired into _add_future.
     async fn write_chunk<'a>(
         &'a mut self,
         chunk: StreamChunk,
@@ -507,16 +622,29 @@ impl AsyncTruncateSinkWriter for SolaceSinkWriter {
                 }
             }
 
-            let topic = self
-                .topic_template
-                .render(row)
-                .map_err(|e| SinkError::Solace(anyhow!(e)))?;
+            // render() returns Ok(None) when null_topic_behavior = "skip" and a NULL
+            // column is encountered. Use let-else to drop those rows silently.
+            let Some(topic) = self.topic_template.render(row)? else {
+                continue;
+            };
 
             let payload: Vec<u8> = self
                 .encoder
                 .encode(row)?
                 .ser_to()
                 .map_err(|e| SinkError::Solace(anyhow!(e)))?;
+
+            if let Some(max_bytes) = self.max_message_bytes {
+                if payload.len() > max_bytes {
+                    tracing::warn!(
+                        topic = %topic,
+                        payload_bytes = payload.len(),
+                        max_bytes,
+                        "Message payload exceeds solace.max_message_bytes — dropping",
+                    );
+                    continue;
+                }
+            }
 
             let dest = MessageDestination::new(DestinationType::Topic, topic.as_str())
                 .map_err(|e| SinkError::Solace(anyhow!("failed to build topic destination: {}", e)))?;
@@ -560,19 +688,31 @@ mod tests {
         Schema::new(vec![Field::with_name(DataType::Varchar, "flight_id")])
     }
 
+    fn schema_two_varchar() -> Schema {
+        Schema::new(vec![
+            Field::with_name(DataType::Varchar, "col_a"),
+            Field::with_name(DataType::Varchar, "col_b"),
+        ])
+    }
+
     // -- TopicTemplate tests --
 
     #[test]
     fn test_topic_template_parse_valid() {
         let schema = schema_varchar_int();
-        let tmpl = TopicTemplate::parse("acme/{region}/code/{status_code}/v1", &schema);
+        let tmpl = TopicTemplate::parse(
+            "acme/{region}/code/{status_code}/v1",
+            &schema,
+            NullTopicBehavior::Error,
+        );
         assert!(tmpl.is_ok());
     }
 
     #[test]
     fn test_topic_template_parse_unknown_column() {
         let schema = schema_varchar_int();
-        let err = TopicTemplate::parse("acme/{unknown}/v1", &schema).unwrap_err();
+        let err = TopicTemplate::parse("acme/{unknown}/v1", &schema, NullTopicBehavior::Error)
+            .unwrap_err();
         assert!(
             format!("{err}").contains("not found in schema"),
             "unexpected error: {err}"
@@ -582,7 +722,8 @@ mod tests {
     #[test]
     fn test_topic_template_parse_unclosed_brace() {
         let schema = schema_varchar_int();
-        let err = TopicTemplate::parse("acme/{region/v1", &schema).unwrap_err();
+        let err = TopicTemplate::parse("acme/{region/v1", &schema, NullTopicBehavior::Error)
+            .unwrap_err();
         assert!(
             format!("{err}").contains("unclosed"),
             "unexpected error: {err}"
@@ -592,21 +733,27 @@ mod tests {
     #[test]
     fn test_topic_template_render() {
         let schema = schema_varchar_int();
-        let tmpl = TopicTemplate::parse("acme/{region}/code/{status_code}/v1", &schema).unwrap();
+        let tmpl = TopicTemplate::parse(
+            "acme/{region}/code/{status_code}/v1",
+            &schema,
+            NullTopicBehavior::Error,
+        )
+        .unwrap();
 
         let chunk = DataChunk::from_pretty(
             "T i
              US 200",
         );
         let row = chunk.row_at(0).0;
-        let topic = tmpl.render(row).unwrap();
+        let topic = tmpl.render(row).unwrap().unwrap();
         assert_eq!(topic, "acme/US/code/200/v1");
     }
 
     #[test]
     fn test_topic_template_render_slash_rejected() {
         let schema = Schema::new(vec![Field::with_name(DataType::Varchar, "path")]);
-        let tmpl = TopicTemplate::parse("root/{path}/leaf", &schema).unwrap();
+        let tmpl =
+            TopicTemplate::parse("root/{path}/leaf", &schema, NullTopicBehavior::Error).unwrap();
 
         let chunk = DataChunk::from_pretty(
             "T
@@ -618,6 +765,85 @@ mod tests {
             format!("{err}").contains("contains '/'"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_null_topic_behavior_error() {
+        let schema = Schema::new(vec![Field::with_name(DataType::Varchar, "region")]);
+        let tmpl =
+            TopicTemplate::parse("acme/{region}/v1", &schema, NullTopicBehavior::Error).unwrap();
+
+        // DataChunk with a NULL varchar (use . for null in from_pretty)
+        let chunk = DataChunk::from_pretty(
+            "T
+             .",
+        );
+        let row = chunk.row_at(0).0;
+        let result = tmpl.render(row);
+        assert!(result.is_err(), "NullTopicBehavior::Error should return Err on NULL");
+    }
+
+    #[test]
+    fn test_null_topic_behavior_skip() {
+        let schema = Schema::new(vec![Field::with_name(DataType::Varchar, "region")]);
+        let tmpl =
+            TopicTemplate::parse("acme/{region}/v1", &schema, NullTopicBehavior::Skip).unwrap();
+
+        let chunk = DataChunk::from_pretty(
+            "T
+             .",
+        );
+        let row = chunk.row_at(0).0;
+        let result = tmpl.render(row).unwrap();
+        assert!(result.is_none(), "NullTopicBehavior::Skip should return Ok(None) on NULL");
+    }
+
+    #[test]
+    fn test_null_topic_behavior_replace() {
+        let schema = Schema::new(vec![Field::with_name(DataType::Varchar, "region")]);
+        let tmpl = TopicTemplate::parse(
+            "acme/{region}/v1",
+            &schema,
+            NullTopicBehavior::Replace("unknown".to_owned()),
+        )
+        .unwrap();
+
+        let chunk = DataChunk::from_pretty(
+            "T
+             .",
+        );
+        let row = chunk.row_at(0).0;
+        let topic = tmpl.render(row).unwrap().unwrap();
+        assert_eq!(topic, "acme/unknown/v1");
+    }
+
+    // -- parse_null_topic_behavior tests --
+
+    #[test]
+    fn test_parse_null_topic_behavior_error() {
+        assert!(matches!(
+            parse_null_topic_behavior("error"),
+            Ok(NullTopicBehavior::Error)
+        ));
+    }
+
+    #[test]
+    fn test_parse_null_topic_behavior_skip() {
+        assert!(matches!(
+            parse_null_topic_behavior("skip"),
+            Ok(NullTopicBehavior::Skip)
+        ));
+    }
+
+    #[test]
+    fn test_parse_null_topic_behavior_replace() {
+        let result = parse_null_topic_behavior("replace:unknown-region").unwrap();
+        assert!(matches!(result, NullTopicBehavior::Replace(v) if v == "unknown-region"));
+    }
+
+    #[test]
+    fn test_parse_null_topic_behavior_invalid() {
+        assert!(parse_null_topic_behavior("bogus").is_err());
     }
 
     // -- parse_duration tests --
@@ -662,6 +888,17 @@ mod tests {
     }
 
     #[test]
+    fn test_dedup_filter_duplicate_column_rejected() {
+        let schema = schema_one_varchar();
+        let err = DedupFilter::new("flight_id,flight_id", Duration::from_secs(300), &schema)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("duplicate column"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_dedup_filter_different_keys_independent() {
         let schema = schema_one_varchar();
         let mut filter = DedupFilter::new("flight_id", Duration::from_secs(300), &schema).unwrap();
@@ -700,6 +937,34 @@ mod tests {
 
         assert!(filter.should_emit(row), "first emission should be allowed");
         assert!(!filter.should_emit(row), "second emission within window should be suppressed");
+    }
+
+    #[test]
+    fn test_dedup_key_no_collision_with_pipe_in_value() {
+        // Verify that rows which previously produced the same |-joined key now have distinct keys.
+        // ("a|b", "c") and ("a", "b|c") must hash differently.
+        let schema = schema_two_varchar();
+        let mut filter =
+            DedupFilter::new("col_a,col_b", Duration::from_secs(300), &schema).unwrap();
+
+        let chunk_ab = DataChunk::from_pretty(
+            "T T
+             a|b c",
+        );
+        let chunk_a_bc = DataChunk::from_pretty(
+            "T T
+             a b|c",
+        );
+
+        let row_ab = chunk_ab.row_at(0).0;
+        let row_a_bc = chunk_a_bc.row_at(0).0;
+
+        // Both should emit — they are distinct rows.
+        assert!(filter.should_emit(row_ab), "('a|b','c') should emit");
+        assert!(
+            filter.should_emit(row_a_bc),
+            "('a','b|c') should also emit — must not collide with ('a|b','c')"
+        );
     }
 
     // -- parse_delivery_mode tests --

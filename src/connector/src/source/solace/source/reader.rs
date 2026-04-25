@@ -47,7 +47,12 @@ use crate::source::{
 /// background ack loop processes them.
 pub static SOLACE_ACK_CHANNEL: LazyLock<
     MokaCache<String, tokio::sync::mpsc::UnboundedSender<Vec<u64>>>,
-> = LazyLock::new(|| moka::future::Cache::builder().build());
+> = LazyLock::new(|| {
+    moka::future::Cache::builder()
+        // Bound memory: sender halves from restarted readers expire after 24 h.
+        .time_to_live(std::time::Duration::from_secs(86_400))
+        .build()
+});
 
 pub fn build_solace_ack_channel_id(source_id: impl std::fmt::Display, split_id: &SplitId) -> String {
     format!("solace_{}_{}", source_id, split_id)
@@ -58,7 +63,7 @@ pub struct SolaceSplitReader {
     /// Keep session alive for the flow's lifetime. Also used to publish
     /// readiness events back to Solace after sentinel detection.
     session: AsyncSession,
-    /// Keep context alive for the session's lifetime.
+    // held alive for C FFI: session borrows context's C-level handle
     #[expect(dead_code)]
     context: Context,
     properties: SolaceProperties,
@@ -98,6 +103,16 @@ impl SplitReader for SolaceSplitReader {
         let sentinel_detected_at = split.sentinel_detected_at.clone();
 
         let ack_mode = SolaceAckMode::from_str_opt(properties.ack_mode.as_deref())?;
+
+        if let Some(bs) = properties.batch_size {
+            if bs > 10_000 {
+                return Err(anyhow::anyhow!(
+                    "solace.batch_size {} exceeds the maximum allowed value of 10000",
+                    bs
+                )
+                .into());
+            }
+        }
 
         // When num_consumers > 1, each reader must bind with a unique client name so the
         // broker doesn't reject the second (and subsequent) connections as duplicates.
@@ -301,6 +316,7 @@ impl SolaceSplitReader {
                         let eb     = self.events_before_sentinel as i64;
                         let tc     = self.total_consumed as i64;
                         let dsn    = self.properties.risingwave_dsn_or_default().to_owned();
+                        let wait_timeout_ms = self.properties.wait_timeout_ms_or_default();
 
                         let (flush_tx, rx) = oneshot::channel::<()>();
                         flush_rx = Some(rx);
@@ -308,7 +324,7 @@ impl SolaceSplitReader {
                         // Spawn WAIT task. Stream keeps flowing so the executor can
                         // checkpoint, which unblocks WAIT.
                         tokio::spawn(async move {
-                            if let Err(e) = barrier_flush_and_status(&queue, &det_at, eb, tc, &dsn).await {
+                            if let Err(e) = barrier_flush_and_status(&queue, &det_at, eb, tc, &dsn, wait_timeout_ms).await {
                                 tracing::error!(error = %e, "Barrier flush failed — readiness will fire anyway");
                             }
                             let _ = flush_tx.send(());
@@ -373,10 +389,11 @@ impl SolaceSplitReader {
                                         let eb     = self.events_before_sentinel as i64;
                                         let tc     = self.total_consumed as i64;
                                         let dsn    = self.properties.risingwave_dsn_or_default().to_owned();
+                                        let wait_timeout_ms = self.properties.wait_timeout_ms_or_default();
                                         let (flush_tx, rx) = oneshot::channel::<()>();
                                         flush_rx = Some(rx);
                                         tokio::spawn(async move {
-                                            if let Err(e) = barrier_flush_and_status(&queue, &det_at, eb, tc, &dsn).await {
+                                            if let Err(e) = barrier_flush_and_status(&queue, &det_at, eb, tc, &dsn, wait_timeout_ms).await {
                                                 tracing::error!(error = %e, "Barrier flush failed — readiness will fire anyway");
                                             }
                                             let _ = flush_tx.send(());
@@ -564,12 +581,18 @@ async fn barrier_flush_and_status(
     events_before: i64,
     total: i64,
     dsn: &str,
+    wait_timeout_ms: u64,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (client, conn) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await?;
 
     tokio::spawn(async move { let _ = conn.await; });
 
-    client.execute("SET streaming_flush_wait_timeout_ms = 60000", &[]).await?;
+    client
+        .execute(
+            &format!("SET streaming_flush_wait_timeout_ms = {}", wait_timeout_ms),
+            &[],
+        )
+        .await?;
     client.execute("WAIT", &[]).await?;
 
     // Write status only after WAIT confirms MV currency.
@@ -741,6 +764,7 @@ mod test {
             100,
             105,
             "host=localhost port=4566 user=root dbname=dev connect_timeout=5",
+            60_000,
         )
         .await;
         // Accept both outcomes — the key invariant is no panic.

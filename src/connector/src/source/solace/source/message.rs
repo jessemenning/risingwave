@@ -150,7 +150,13 @@ impl SolaceMessage {
                     .flatten()
                     .map(|p| p.to_vec())
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "Failed to extract payload from Solace message — \
+                     both string and binary extractors returned None; treating as empty payload"
+                );
+                vec![]
+            });
 
         let destination = msg
             .get_destination()

@@ -104,6 +104,13 @@ pub struct SolaceProperties {
     #[serde(rename = "solace.num_consumers")]
     pub num_consumers: Option<usize>,
 
+    /// Timeout in milliseconds for the RisingWave `WAIT` barrier flush command issued
+    /// after sentinel detection. Defaults to 60000 (60 seconds). Increase for large
+    /// historical backfills where materialized view catch-up may take longer.
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(rename = "solace.wait_timeout_ms")]
+    pub wait_timeout_ms: Option<u64>,
+
     #[serde(flatten)]
     pub unknown_fields: HashMap<String, String>,
 }
@@ -114,6 +121,11 @@ impl SolaceProperties {
         self.risingwave_dsn
             .as_deref()
             .unwrap_or("host=localhost port=4566 user=root dbname=dev connect_timeout=5")
+    }
+
+    /// Returns the configured WAIT timeout in milliseconds, or the default of 60 000 ms.
+    pub fn wait_timeout_ms_or_default(&self) -> u64 {
+        self.wait_timeout_ms.unwrap_or(60_000)
     }
 }
 
@@ -332,6 +344,33 @@ mod test {
         let props: SolaceProperties =
             serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
         assert_eq!(props.num_consumers, None);
+    }
+
+    #[test]
+    fn test_parse_wait_timeout_ms() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "solace.url".to_owned() => "tcp://localhost:55555".to_owned(),
+            "solace.queue".to_owned() => "test-queue".to_owned(),
+            "solace.wait_timeout_ms".to_owned() => "120000".to_owned(),
+        };
+
+        let props: SolaceProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(props.wait_timeout_ms, Some(120_000));
+        assert_eq!(props.wait_timeout_ms_or_default(), 120_000);
+    }
+
+    #[test]
+    fn test_wait_timeout_ms_default() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "solace.url".to_owned() => "tcp://localhost:55555".to_owned(),
+            "solace.queue".to_owned() => "test-queue".to_owned(),
+        };
+
+        let props: SolaceProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(props.wait_timeout_ms, None);
+        assert_eq!(props.wait_timeout_ms_or_default(), 60_000);
     }
 
     #[test]
