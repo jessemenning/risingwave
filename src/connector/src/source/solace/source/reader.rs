@@ -263,6 +263,16 @@ impl SplitReader for SolaceSplitReader {
         // Defuse the guard — construction succeeded; transfer flow ownership to reader.
         let flow = flow_guard.0.take().unwrap();
 
+        // Explicitly start the flow — belt-and-suspenders for broker versions where
+        // FLOW_START_STATE=1 alone does not open the delivery window in CLIENT ack mode.
+        if let Err(e) = flow.start() {
+            tracing::warn!(
+                queue = %properties.queue,
+                error = %e,
+                "flow.start() returned non-OK — delivery window may not open (may be benign)",
+            );
+        }
+
         let reader = Self {
             flow,
             session,
