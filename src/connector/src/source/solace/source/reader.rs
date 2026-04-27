@@ -76,6 +76,25 @@ static STATUS_POOL: tokio::sync::OnceCell<PgPool> = tokio::sync::OnceCell::const
 /// harmless because all DDL statements are idempotent.
 static STATUS_SCHEMA_INITIALISED: OnceLock<()> = OnceLock::new();
 
+/// Drop guard for [`OwnedAsyncFlow`] during [`SolaceSplitReader`] construction.
+///
+/// If [`SolaceSplitReader::new`] returns an error after the flow is created, this
+/// guard ensures the flow is explicitly dropped — triggering a broker unbind — rather
+/// than remaining in a `windowSize=0` limbo until the TCP connection times out.
+/// Defuse with `.take()` before returning `Ok(reader)`.
+struct FlowGuard(Option<OwnedAsyncFlow>);
+
+impl Drop for FlowGuard {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            tracing::warn!(
+                "Solace flow dropped during SolaceSplitReader construction — \
+                 broker will see a transient bind/unbind"
+            );
+        }
+    }
+}
+
 pub struct SolaceSplitReader {
     flow: OwnedAsyncFlow,
     /// Keep session alive for the flow's lifetime. Also used to publish
@@ -152,32 +171,16 @@ impl SplitReader for SolaceSplitReader {
             None
         };
 
-        // Always use Client ack mode — we control when ack happens based on ack_mode.
-        let (context, session) = properties
-            .common
-            .build_async_session(effective_client_name.as_deref())?;
-        let flow = session
-            .create_flow(&properties.queue, AckMode::Client)
-            .map_err(|e| anyhow::anyhow!("failed to create Solace flow: {e}"))?;
-
-        // For checkpoint mode, register the ack sender so WaitCheckpointTask can
-        // push message IDs to us, then store the receiver for inline draining.
-        let ack_rx = if matches!(ack_mode, SolaceAckMode::Checkpoint) {
-            let (ack_tx, ack_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u64>>();
-            let channel_id = build_solace_ack_channel_id(source_ctx.source_id, &split_id);
-            SOLACE_ACK_CHANNEL
-                .entry(channel_id)
-                .and_upsert_with(|_| std::future::ready(ack_tx))
-                .await;
-            Some(ack_rx)
-        } else {
-            None
-        };
-
-        // Ensure the shared status pool is initialized with the DSN from this reader.
-        // Idempotent: second and subsequent calls are no-ops.
+        // ── Option A: status pool initialized before Solace resource acquisition ──
+        // If pool construction fails here, new() returns before any Solace resources
+        // are acquired — no orphaned broker binds, no windowSize=0 limbo.
+        //
+        // ── Option B: pool init is non-fatal ─────────────────────────────────────
+        // Sentinel cross-reader coordination degrades gracefully on pool failure —
+        // all downstream callers already guard with STATUS_POOL.get() returning
+        // Option<&PgPool>. Message flow must not be gated on a monitoring concern.
         let dsn = properties.risingwave_dsn_or_default().to_owned();
-        STATUS_POOL
+        if let Err(e) = STATUS_POOL
             .get_or_try_init(|| async {
                 let mgr =
                     PostgresConnectionManager::new_from_stringlike(&dsn, tokio_postgres::NoTls)
@@ -189,7 +192,12 @@ impl SplitReader for SolaceSplitReader {
                     .map_err(|e| anyhow::anyhow!("failed to build status pool: {e}"))
             })
             .await
-            .map_err(|e: anyhow::Error| anyhow::anyhow!("{e}"))?;
+        {
+            tracing::warn!(
+                error = %e,
+                "Status pool init failed — sentinel coordination disabled for this reader"
+            );
+        }
 
         // If another reader in this consumer group already detected the sentinel, the
         // status table will show is_ready = true. Boot directly into live mode rather
@@ -222,6 +230,38 @@ impl SplitReader for SolaceSplitReader {
         } else {
             sentinel_detected
         };
+
+        // Always use Client ack mode — we control when ack happens based on ack_mode.
+        let (context, session) = properties
+            .common
+            .build_async_session(effective_client_name.as_deref())?;
+
+        // ── Option C: explicit flow cleanup on any construction error ─────────────
+        // FlowGuard logs and drops the flow if new() returns an error after this point,
+        // triggering a broker unbind rather than leaving the flow in windowSize=0 limbo.
+        // Defused via .take() before Ok(reader) — Drop runs silently when flow is None.
+        let mut flow_guard = FlowGuard(Some(
+            session
+                .create_flow(&properties.queue, AckMode::Client)
+                .map_err(|e| anyhow::anyhow!("failed to create Solace flow: {e}"))?,
+        ));
+
+        // For checkpoint mode, register the ack sender so WaitCheckpointTask can
+        // push message IDs to us, then store the receiver for inline draining.
+        let ack_rx = if matches!(ack_mode, SolaceAckMode::Checkpoint) {
+            let (ack_tx, ack_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u64>>();
+            let channel_id = build_solace_ack_channel_id(source_ctx.source_id, &split_id);
+            SOLACE_ACK_CHANNEL
+                .entry(channel_id)
+                .and_upsert_with(|_| std::future::ready(ack_tx))
+                .await;
+            Some(ack_rx)
+        } else {
+            None
+        };
+
+        // Defuse the guard — construction succeeded; transfer flow ownership to reader.
+        let flow = flow_guard.0.take().unwrap();
 
         let reader = Self {
             flow,

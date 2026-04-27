@@ -124,6 +124,37 @@ Active settings in `risedev-components.user.env`:
 Active settings in `.cargo/config.toml`:
 - `jobs = 4` — limits parallelism to avoid OOM on this machine
 
+### Rebuilding the FAA Docker image after connector changes
+
+The FAA project (`~/faa-streaming-arch`) pulls `ghcr.io/jessemenning/risingwave:latest`. That image is **not** rebuilt by GHA automatically — you must rebuild it locally after any changes to `src/connector/src/source/solace/`.
+
+The FAA Dockerfile lives at `~/solace-streaming-arch/risingwave-solace/Dockerfile` (a thin wrapper that copies a stripped binary into the upstream base image).
+
+```bash
+# 1. Build the patched binary (dev profile — fastest)
+cd ~/risingwave
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+export PROTOC=/usr/bin/protoc SOLACE_USE_SYSTEM_SSL=1 \
+  OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu \
+  OPENSSL_INCLUDE_DIR=/usr/include OPENSSL_STATIC=0
+RUSTFLAGS="-Ctarget-feature=+avx2 --cfg tokio_unstable -Zhigher-ranked-assumptions \
+  -Clink-arg=-fuse-ld=lld -Clink-arg=-Wl,--no-rosegment -Clink-arg=-Wl,--no-as-needed" \
+cargo build -p risingwave_cmd_all --profile dev
+strip -o target/debug/risingwave-stripped target/debug/risingwave
+
+# 2. Build and tag the Docker image as :latest
+cp ~/risingwave/target/debug/risingwave-stripped \
+   ~/solace-streaming-arch/risingwave-solace/risingwave-stripped
+docker build -t ghcr.io/jessemenning/risingwave:latest \
+  ~/solace-streaming-arch/risingwave-solace/
+
+# 3. Start the FAA stack (--skip-build is correct — risingwave uses image:, not build:)
+cd ~/faa-streaming-arch
+./demo/run_demo.sh --skip-build
+```
+
+Note: `--skip-build` is always correct here because the `risingwave` service in the FAA `docker-compose.yml` uses `image:` not `build:`. The image was already updated in step 2.
+
 ## Connector Development
 
 See `docs/dev/src/connector/intro.md`.
