@@ -614,6 +614,11 @@ pub struct SolaceSinkWriter {
     encoder: JsonEncoder,
     dedup_filter: Option<DedupFilter>,
     max_message_bytes: Option<usize>,
+    // Retained for session rebuild on publish error
+    common: SolaceCommon,
+    writer_name: String,
+    // Running total of messages dropped due to solace.max_message_bytes
+    oversized_dropped: u64,
 }
 
 impl SolaceSinkWriter {
@@ -641,6 +646,7 @@ impl SolaceSinkWriter {
             None
         };
 
+        let common = config.common.clone();
         let (context, session) = config
             .common
             .build_async_session(Some(name))
@@ -654,7 +660,25 @@ impl SolaceSinkWriter {
             encoder,
             dedup_filter,
             max_message_bytes,
+            common,
+            writer_name: name.to_owned(),
+            oversized_dropped: 0,
         })
+    }
+
+    /// Tear down the current Solace session and create a fresh one.
+    ///
+    /// Called after a publish error so the next write attempt uses a live
+    /// connection rather than retrying against a broken session.
+    fn rebuild_session(&mut self) -> Result<()> {
+        tracing::warn!(writer = %self.writer_name, "Rebuilding Solace session after publish error");
+        let (context, session) = self
+            .common
+            .build_async_session(Some(&self.writer_name))
+            .map_err(|e| SinkError::Solace(anyhow!("Solace session rebuild failed: {}", e)))?;
+        self._context = context;
+        self.session = session;
+        Ok(())
     }
 }
 
@@ -697,10 +721,12 @@ impl AsyncTruncateSinkWriter for SolaceSinkWriter {
 
             if let Some(max_bytes) = self.max_message_bytes {
                 if payload.len() > max_bytes {
+                    self.oversized_dropped += 1;
                     tracing::warn!(
                         topic = %topic,
                         payload_bytes = payload.len(),
                         max_bytes,
+                        total_dropped = self.oversized_dropped,
                         "Message payload exceeds solace.max_message_bytes — dropping",
                     );
                     continue;
@@ -719,15 +745,49 @@ impl AsyncTruncateSinkWriter for SolaceSinkWriter {
 
             match self.delivery_mode {
                 SolaceDeliveryMode::Direct => {
-                    self.session
-                        .publish(msg)
-                        .map_err(|e: SessionError| SinkError::Solace(anyhow!("Solace publish error: {}", e)))?;
+                    if let Err(e) = self.session.publish(msg) {
+                        tracing::warn!(
+                            error = %e,
+                            topic = %topic,
+                            "Solace publish error; rebuilding session and retrying once",
+                        );
+                        self.rebuild_session()?;
+                        let dest2 = MessageDestination::new(DestinationType::Topic, topic.as_str())
+                            .map_err(|e| SinkError::Solace(anyhow!("failed to build topic destination: {}", e)))?;
+                        let msg2 = OutboundMessageBuilder::new()
+                            .delivery_mode(self.delivery_mode.into_solace())
+                            .destination(dest2)
+                            .payload(payload.as_slice())
+                            .build()
+                            .map_err(|e| SinkError::Solace(anyhow!("failed to build Solace message: {}", e)))?;
+                        self.session
+                            .publish(msg2)
+                            .map_err(|e: SessionError| SinkError::Solace(anyhow!("Solace publish error after session rebuild: {}", e)))?;
+                    }
                 }
                 SolaceDeliveryMode::Persistent | SolaceDeliveryMode::NonPersistent => {
-                    let ack_rx = self
-                        .session
-                        .publish_with_ack(msg)
-                        .map_err(|e: SessionError| SinkError::Solace(anyhow!("Solace publish error: {}", e)))?;
+                    let ack_rx = match self.session.publish_with_ack(msg) {
+                        Ok(ack_rx) => ack_rx,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                topic = %topic,
+                                "Solace publish error; rebuilding session and retrying once",
+                            );
+                            self.rebuild_session()?;
+                            let dest2 = MessageDestination::new(DestinationType::Topic, topic.as_str())
+                                .map_err(|e| SinkError::Solace(anyhow!("failed to build topic destination: {}", e)))?;
+                            let msg2 = OutboundMessageBuilder::new()
+                                .delivery_mode(self.delivery_mode.into_solace())
+                                .destination(dest2)
+                                .payload(payload.as_slice())
+                                .build()
+                                .map_err(|e| SinkError::Solace(anyhow!("failed to build Solace message: {}", e)))?;
+                            self.session
+                                .publish_with_ack(msg2)
+                                .map_err(|e: SessionError| SinkError::Solace(anyhow!("Solace publish error after session rebuild: {}", e)))?
+                        }
+                    };
                     let future = ack_rx.map(|r| match r {
                         Ok(Ok(())) => Ok(()),
                         Ok(Err(e)) => {
