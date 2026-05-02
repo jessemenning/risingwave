@@ -28,6 +28,7 @@ pub mod encoder;
 pub mod file_sink;
 pub mod formatter;
 feature_gated_sink_mod!(google_pubsub, GooglePubSub, "google_pubsub");
+pub mod http;
 pub mod iceberg;
 pub mod kafka;
 pub mod kinesis;
@@ -126,6 +127,7 @@ macro_rules! for_all_sinks {
                 { Kafka, $crate::sink::kafka::KafkaSink, $crate::sink::kafka::KafkaConfig },
                 { Pulsar, $crate::sink::pulsar::PulsarSink, $crate::sink::pulsar::PulsarConfig },
                 { BlackHole, $crate::sink::trivial::BlackHoleSink, () },
+                { Http, $crate::sink::http::HttpSink, $crate::sink::http::HttpConfig },
                 { Kinesis, $crate::sink::kinesis::KinesisSink, $crate::sink::kinesis::KinesisSinkConfig },
                 { ClickHouse, $crate::sink::clickhouse::ClickHouseSink, $crate::sink::clickhouse::ClickHouseConfig },
                 { Iceberg, $crate::sink::iceberg::IcebergSink, $crate::sink::iceberg::IcebergConfig },
@@ -995,6 +997,12 @@ pub enum SinkError {
     ClickHouse(String),
     #[error("Redis error: {0}")]
     Redis(String),
+    #[error("Http error: {0}")]
+    Http(
+        #[source]
+        #[backtrace]
+        anyhow::Error,
+    ),
     #[error("Mqtt error: {0}")]
     Mqtt(
         #[source]

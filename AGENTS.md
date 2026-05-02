@@ -155,6 +155,18 @@ cd ~/faa-streaming-arch
 
 Note: `--skip-build` is always correct here because the `risingwave` service in the FAA `docker-compose.yml` uses `image:` not `build:`. The image was already updated in step 2.
 
+## Pull Request Submission Labels
+
+PR labels in this repository can affect CI coverage and documentation follow-up. To keep normal coding work lightweight, load the detailed label protocol only at PR submission time.
+
+When opening or updating a pull request, changing PR labels, or marking a PR ready for review:
+
+1. Read `.agents/PR_LABELING.md`.
+2. Inspect the current PR labels and draft state before adding anything:
+   `gh pr view <PR> --json isDraft,labels,title,body,files`
+3. Add only validated missing labels. Do not remove existing labels unless explicitly instructed by a maintainer.
+4. In the final PR report, list labels added, labels intentionally not added, local tests run, and CI labels requested.
+
 ## Connector Development
 
 See `docs/dev/src/connector/intro.md`.
