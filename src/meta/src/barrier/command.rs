@@ -1329,6 +1329,12 @@ impl Command {
         upstream_mv_table_id: TableId,
         subscription_id: SubscriptionId,
     ) -> Mutation {
+        tracing::debug!(
+            target: "rw_subscription_debug",
+            subscriber_id = ?subscription_id.as_subscriber_id(),
+            ?upstream_mv_table_id,
+            "create_subscription_to_mutation: building Add mutation"
+        );
         {
             Mutation::Add(AddMutation {
                 actor_dispatchers: Default::default(),

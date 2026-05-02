@@ -339,6 +339,16 @@ impl<K: std::fmt::Debug + Eq + std::hash::Hash, Item: std::fmt::Debug, Info: std
         &mut self,
         cond: impl FnOnce(EpochPair) -> bool,
     ) -> Option<(EpochPair, HashMap<K, Item>, Info)> {
+        if tracing::enabled!(target: "rw_subscription_debug", tracing::Level::DEBUG) {
+            tracing::debug!(
+                target: "rw_subscription_debug",
+                inflight_len = self.inflight_barriers.len(),
+                collected_len = self.collected_barriers.len(),
+                front_epoch = ?self.collected_barriers.front().map(|b| b.epoch),
+                back_epoch = ?self.collected_barriers.back().map(|b| b.epoch),
+                "take_collected_if: deque state before pop_front_if"
+            );
+        }
         self.collected_barriers
             .pop_front_if(move |barrier| cond(barrier.epoch))
             .map(|barrier| (barrier.epoch, barrier.collected, barrier.info))

@@ -185,6 +185,13 @@ impl LogStoreBufferInner {
         end_seq_id: SeqId,
         new_vnode_bitmap: Bitmap,
     ) {
+        debug_assert!(
+            start_seq_id <= end_seq_id,
+            "add_flushed: inverted seq_id range epoch={} start={} end={}",
+            epoch,
+            start_seq_id,
+            end_seq_id
+        );
         let curr_chunk_size = (end_seq_id - start_seq_id + 1) as usize;
         if let Some((
             item_epoch,
