@@ -22,7 +22,9 @@ name: Build Docker Image (Fork)
 
 on:
   push:
-    branches: [feat/solace-source-connector]
+    branches:
+      - feat/solace-source-connector
+      - feat/solace-sink-connector
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
@@ -36,10 +38,11 @@ on:
         type: string
         default: 'solace-connector'
       cargo_profile:
-        description: 'Cargo build profile — dev ~30 min, release ~60-70 min'
+        description: 'Cargo build profile — dev ~30 min, dev-prod ~30 min (no debug_assertions), release ~60-70 min'
         required: true
         type: choice
         options:
+          - dev-prod
           - dev
           - release
           - patch-production
@@ -82,7 +85,7 @@ jobs:
           VERSION=$(grep -m 1 '^version' Cargo.toml | cut -d '"' -f 2)
           COMMIT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
           LABEL="${{ github.event.inputs.label || env.DEFAULT_LABEL }}"
-          PROFILE="${{ github.event.inputs.cargo_profile }}"
+          PROFILE="${{ github.event.inputs.cargo_profile || 'dev' }}"
           # Append profile to label unless it's the default (release), so
           # release builds keep the stable :solace-connector tag while
           # dev-docker / ci-dev etc. get their own tags e.g. :solace-connector-dev-docker
@@ -133,3 +136,20 @@ jobs:
           # Together they cover both cases: unchanged layers and changed-but-cached crates.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Notify faa-streaming-arch of new release
+        if: ${{ github.event.inputs.cargo_profile == 'release' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.FAA_DISPATCH_TOKEN }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: 'jessemenning',
+              repo: 'faa-streaming-arch',
+              event_type: 'risingwave-release',
+              client_payload: {
+                label: '${{ steps.meta.outputs.label }}',
+                image_tag: '${{ steps.meta.outputs.image_tag }}',
+                sha: '${{ github.sha }}'
+              }
+            });

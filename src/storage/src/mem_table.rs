@@ -314,13 +314,28 @@ impl MemTable {
 
                 match old_op {
                     KeyOp::Insert(old_op_new_value) => {
-                        if sanity_check_enabled() && !value_checker(old_op_new_value, &old_value) {
-                            return Err(Box::new(MemTableError::InconsistentOperation {
-                                table_id: self.table_id,
-                                key: e.key().clone(),
-                                prev: e.get().clone(),
-                                new: KeyOp::Update((old_value, new_value)),
-                            }));
+                        if sanity_check_enabled() {
+                            if !value_checker(old_op_new_value, &old_value) {
+                                return Err(Box::new(MemTableError::InconsistentOperation {
+                                    table_id: self.table_id,
+                                    key: e.key().clone(),
+                                    prev: e.get().clone(),
+                                    new: KeyOp::Update((old_value, new_value)),
+                                }));
+                            }
+                        } else if !value_checker(old_op_new_value, &old_value) {
+                            // value_checker already logs the deserialized values on mismatch;
+                            // add table context here so the log entries can be correlated.
+                            // (e.key() cannot be borrowed here while old_op_new_value holds
+                            //  a mutable borrow on e; the key appears in the value_checker log.)
+                            tracing::error!(
+                                table_id = %self.table_id,
+                                stored_insert_bytes = ?old_op_new_value.as_ref(),
+                                incoming_old_value_bytes = ?old_value.as_ref(),
+                                "MemTable Insert\u{2192}Update old_value mismatch on table {} \
+                                 (sanity check disabled, proceeding with new_value)",
+                                self.table_id
+                            );
                         }
 
                         let new_op = KeyOp::Insert(new_value);

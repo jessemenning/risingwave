@@ -404,6 +404,13 @@ debug = 0 # no debug info, only symbols
 inherits = "dev"
 strip = "debuginfo"
 
+# Production-like developer build: debug symbols retained, but debug_assertions disabled.
+# Use when you need the binary to tolerate MemTable sanity-check failures silently (matching
+# release behavior) without giving up stack traces.
+[profile.dev-prod]
+inherits = "dev"
+debug-assertions = false
+
 [profile.ci-release]
 inherits = "release"
 incremental = false

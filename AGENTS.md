@@ -131,7 +131,11 @@ The FAA project (`~/faa-streaming-arch`) pulls `ghcr.io/jessemenning/risingwave:
 The FAA Dockerfile lives at `~/solace-streaming-arch/risingwave-solace/Dockerfile` (a thin wrapper that copies a stripped binary into the upstream base image).
 
 ```bash
-# 1. Build the patched binary (dev profile — fastest)
+# 1. Build the patched binary
+# Use --profile dev-prod (disables debug_assertions, matches production sanity-check
+# behavior — silently logs MemTable inconsistencies instead of crashing).
+# Use --profile dev only if you intentionally want strict sanity checks (will crash on
+# MemTable inconsistency errors that upstream production silently tolerates).
 cd ~/risingwave
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 export PROTOC=/usr/bin/protoc SOLACE_USE_SYSTEM_SSL=1 \
@@ -139,11 +143,11 @@ export PROTOC=/usr/bin/protoc SOLACE_USE_SYSTEM_SSL=1 \
   OPENSSL_INCLUDE_DIR=/usr/include OPENSSL_STATIC=0
 RUSTFLAGS="-Ctarget-feature=+avx2 --cfg tokio_unstable -Zhigher-ranked-assumptions \
   -Clink-arg=-fuse-ld=lld -Clink-arg=-Wl,--no-rosegment -Clink-arg=-Wl,--no-as-needed" \
-cargo build -p risingwave_cmd_all --profile dev
-strip -o target/debug/risingwave-stripped target/debug/risingwave
+cargo build -p risingwave_cmd_all --profile dev-prod
+strip -o target/dev-prod/risingwave-stripped target/dev-prod/risingwave
 
 # 2. Build and tag the Docker image as :latest
-cp ~/risingwave/target/debug/risingwave-stripped \
+cp ~/risingwave/target/dev-prod/risingwave-stripped \
    ~/solace-streaming-arch/risingwave-solace/risingwave-stripped
 docker build -t ghcr.io/jessemenning/risingwave:latest \
   ~/solace-streaming-arch/risingwave-solace/

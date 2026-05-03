@@ -418,6 +418,13 @@ impl<K: HashKey, S: StateStore> HashAggExecutor<K, S> {
                 continue;
             };
 
+            tracing::trace!(
+                table_id = %this.intermediate_state_table.table_id(),
+                group_key = ?agg_group.group_key(),
+                change_type = ?inter_states_change.to_record_type(),
+                "hash_agg flush_data: writing state change"
+            );
+
             if this.emit_on_window_close {
                 vars.buffer
                     .apply_change(inter_states_change, &mut this.intermediate_state_table);
@@ -640,6 +647,13 @@ impl<K: HashKey, S: StateStore> HashAggExecutor<K, S> {
 
                     if vars.dirty_groups.estimated_heap_size() >= this.max_dirty_groups_heap_size {
                         // flush dirty groups if heap size is too large, to better prevent from OOM
+                        tracing::debug!(
+                            table_id = %this.intermediate_state_table.table_id(),
+                            heap_size = vars.dirty_groups.estimated_heap_size(),
+                            max_heap_size = this.max_dirty_groups_heap_size,
+                            dirty_group_count = vars.dirty_groups.len(),
+                            "hash_agg: mid-epoch memory-pressure flush triggered"
+                        );
                         #[for_await]
                         for chunk in Self::flush_data(&mut this, &mut vars) {
                             yield Message::Chunk(chunk?);
